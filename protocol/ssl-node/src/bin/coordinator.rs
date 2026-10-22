@@ -103,6 +103,20 @@ fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
             first_seen_mined_ns INTEGER NOT NULL
         );",
     )?;
+    // v2: events carry the order they belong to. Older events are backfilled from their
+    // titles, which always name the order ("Order zs-1 opened").
+    let has_order_id: bool = conn.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'order_id'")?.exists([])?;
+    if !has_order_id {
+        conn.execute_batch(
+            "ALTER TABLE events ADD COLUMN order_id TEXT;
+             UPDATE events SET order_id = CASE
+                 WHEN instr(substr(title, instr(title, 'zs-')), ' ') = 0 THEN substr(title, instr(title, 'zs-'))
+                 ELSE substr(title, instr(title, 'zs-'), instr(substr(title, instr(title, 'zs-')), ' ') - 1)
+               END
+             WHERE instr(title, 'zs-') > 0;
+             CREATE INDEX IF NOT EXISTS events_order ON events (order_id);",
+        )?;
+    }
     Ok(conn)
 }
 
@@ -149,9 +163,12 @@ impl Coordinator {
         (usd * 10f64.powi(self.vault_config.token_decimals as i32)).floor() as u128
     }
 
-    async fn event(&self, kind: &str, title: &str, detail: &str) {
+    async fn event(&self, order_id: &str, kind: &str, title: &str, detail: &str) {
         let db = self.db.lock().await;
-        if let Err(e) = db.execute("INSERT INTO events (kind, title, detail, at_ns) VALUES (?1, ?2, ?3, ?4)", params![kind, title, detail, now_ns() as i64]) {
+        if let Err(e) = db.execute(
+            "INSERT INTO events (order_id, kind, title, detail, at_ns) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![order_id, kind, title, detail, now_ns() as i64],
+        ) {
             tracing::error!(error = %e, "recording an event");
         }
     }
@@ -261,10 +278,10 @@ impl Coordinator {
         let zec = format_units(zec_zat as u128, 8);
         let out = format_units(amount_out, self.vault_config.token_decimals);
         if !open {
-            self.event("order", &format!("Order {id} not opened"), &format!("{approved} of {} operators approved: {}", self.vault_config.threshold, reasons.join("; "))).await;
+            self.event(&id, "order", &format!("Order {id} not opened"), &format!("{approved} of {} operators approved: {}", self.vault_config.threshold, reasons.join("; "))).await;
             return Err((StatusCode::SERVICE_UNAVAILABLE, format!("operators did not approve the order ({approved} of {} needed): {}", self.vault_config.threshold, reasons.join("; "))));
         }
-        self.event("order", &format!("Order {id} opened"), &format!("{zec} ZEC → {out} {} for {}", self.vault_config.token_symbol, req.recipient)).await;
+        self.event(&id, "order", &format!("Order {id} opened"), &format!("{zec} ZEC → {out} {} for {}", self.vault_config.token_symbol, req.recipient)).await;
         Ok(json!({
             "id": id,
             "state": "awaiting_deposit",
@@ -328,7 +345,7 @@ impl Coordinator {
                     "refunded" => format!("Order {id} refunded"),
                     other => format!("Order {id} {other}"),
                 };
-                self.event(if final_state == "released" { "release" } else { "order" }, &title, &format!("vault state: {final_state}")).await;
+                self.event(id, if final_state == "released" { "release" } else { "order" }, &title, &format!("vault state: {final_state}")).await;
             }
             return Ok(());
         }
@@ -375,7 +392,7 @@ impl Coordinator {
                 "needs_refund" => ("refund", format!("Order {id} needs a refund")),
                 _ => ("order", format!("Order {id}: {next}")),
             };
-            self.event(kind, &title, &format!("{} of {} ZEC received", format_units(received as u128, 8), format_units(zec_zat as u128, 8))).await;
+            self.event(id, kind, &title, &format!("{} of {} ZEC received", format_units(received as u128, 8), format_units(zec_zat as u128, 8))).await;
         }
         if matches!(status, DepositStatus::Paid { .. }) {
             // Each operator decides for itself; this only asks them to look now.
@@ -509,16 +526,35 @@ async fn quote(State(c): State<App>, Query(q): Query<QuoteQuery>) -> Response {
     .into_response()
 }
 
+fn event_rows(db: &rusqlite::Connection, order_id: Option<&str>, limit: i64) -> Result<Vec<Value>> {
+    let mut stmt = db.prepare(
+        "SELECT id, kind, title, detail, at_ns, order_id FROM events
+         WHERE (?1 IS NULL OR order_id = ?1) ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![order_id, limit], |r| {
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?.to_string(),
+            "kind": r.get::<_, String>(1)?,
+            "title": r.get::<_, String>(2)?,
+            "detail": r.get::<_, String>(3)?,
+            "at": ns_to_rfc3339(r.get::<_, i64>(4)? as u64),
+            "orderId": r.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 async fn events(State(c): State<App>, Query(q): Query<Limit>) -> Response {
     let db = c.db.lock().await;
-    let rows: Result<Vec<Value>> = (|| {
-        let mut stmt = db.prepare("SELECT id, kind, title, detail, at_ns FROM events ORDER BY id DESC LIMIT ?1")?;
-        let rows = stmt.query_map([q.limit.unwrap_or(50).clamp(1, 200)], |r| {
-            Ok(json!({ "id": r.get::<_, i64>(0)?.to_string(), "kind": r.get::<_, String>(1)?, "title": r.get::<_, String>(2)?, "detail": r.get::<_, String>(3)?, "at": ns_to_rfc3339(r.get::<_, i64>(4)? as u64) }))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    })();
-    match rows {
+    match event_rows(&db, None, q.limit.unwrap_or(50).clamp(1, 200)) {
+        Ok(v) => Json(json!(v)).into_response(),
+        Err(e) => err_json(internal(e)),
+    }
+}
+
+async fn order_events(State(c): State<App>, Path(id): Path<String>) -> Response {
+    let db = c.db.lock().await;
+    match event_rows(&db, Some(&id), 200) {
         Ok(v) => Json(json!(v)).into_response(),
         Err(e) => err_json(internal(e)),
     }
@@ -607,6 +643,7 @@ async fn main() -> Result<()> {
         .route("/v1/quote", get(quote))
         .route("/v1/orders", post(create_order).get(list_orders))
         .route("/v1/orders/{id}", get(get_order))
+        .route("/v1/orders/{id}/events", get(order_events))
         .route("/v1/events", get(events))
         .route("/v1/treasury", get(treasury))
         .route("/v1/signing-rounds", get(signing_rounds))

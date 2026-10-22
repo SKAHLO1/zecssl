@@ -42,6 +42,13 @@ export const config = {
   operators: operators(str("OPERATOR_ENDPOINTS")),
   threshold: { t: int("THRESHOLD_T", 2), n: int("THRESHOLD_N", 3) },
 
+  // Testnet faucet signer: account + secret key, or a NEAR CLI credentials file.
+  faucetAccount: str("NEAR_FAUCET_ACCOUNT"),
+  faucetKey: str("NEAR_FAUCET_KEY"),
+  faucetCredentials: str("NEAR_FAUCET_CREDENTIALS"),
+  // Behind a proxy (Render, Fly), trust X-Forwarded-For for client addresses.
+  trustProxy: str("TRUST_PROXY") === "true",
+
   spreadBps: int("QUOTE_SPREAD_BPS", 25),
   intentsReferenceRefund: str("INTENTS_REFERENCE_REFUND"),
 

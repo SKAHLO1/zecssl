@@ -1,6 +1,6 @@
 "use client";
 
-import { Activity, ArrowRight, ChartCandlestick, Gauge, LayoutDashboard, Menu, Network, Repeat, Vault, X } from "lucide-react";
+import { Activity, ArrowRight, ChartCandlestick, Droplets, Gauge, LayoutDashboard, Menu, Network, Repeat, Vault, X } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -17,6 +17,7 @@ const nav = [
   { href: "/app/markets", label: "Markets", icon: ChartCandlestick },
   { href: "/app/activity", label: "Activity", icon: Activity },
   { href: "/app/status", label: "System status", icon: Gauge },
+  { href: "/app/faucet", label: "Testnet faucet", icon: Droplets },
 ];
 
 function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
@@ -72,7 +73,7 @@ function TopBar({ title, onMenu }: { title: string; onMenu: () => void }) {
             <StatusDot state={connection === "live" ? "ok" : connection === "connecting" ? "warn" : "down"} />
             {connection === "live" ? "Live" : connection === "connecting" ? "Connecting" : "Offline"}
             <span className="text-line-strong">|</span>
-            Zcash <span className="tnum font-semibold text-ink">{num(zcash?.height)}</span>
+            {near?.network === "testnet" ? "Zcash mainnet" : "Zcash"} <span className="tnum font-semibold text-ink">{num(zcash?.height)}</span>
             <span className="text-line-strong">|</span>
             NEAR {near?.network} <span className="tnum font-semibold text-ink">{num(near?.height)}</span>
           </span>
@@ -92,12 +93,14 @@ const titles: [string, string][] = [
   ["/app/markets", "Markets"],
   ["/app/activity", "Activity"],
   ["/app/status", "System status"],
+  ["/app/faucet", "Testnet faucet"],
+  ["/app/orders", "Order"],
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const path = usePathname();
   const [open, setOpen] = useState(false);
-  const { loaded, connection } = useLive();
+  const { loaded, connection, near } = useLive();
   useEffect(() => setOpen(false), [path]);
   const title = titles.find(([p]) => path.startsWith(p))?.[1] ?? "Dashboard";
 
@@ -118,6 +121,14 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       )}
       <TopBar title={title} onMenu={() => setOpen(true)} />
+      {near?.network === "testnet" && (
+        <div className="border-b border-gold/30 bg-gold-50 px-4 py-2 text-xs text-gold-600 sm:px-6 lg:px-8">
+          <span className="font-semibold">Testnet.</span> Swaps settle on Zcash testnet and NEAR testnet; TAZ and test USDC have no value.{" "}
+          <Link href="/app/faucet" className="font-semibold underline underline-offset-2">
+            Get test funds
+          </Link>
+        </div>
+      )}
       {!loaded && connection !== "live" && (
         <div className="border-b border-warn/30 bg-warn-50 px-4 py-2.5 text-sm text-warn sm:px-6 lg:px-8">
           Can&apos;t reach the ZEC SSL API yet. Live data will appear as soon as it responds.

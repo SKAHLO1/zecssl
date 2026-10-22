@@ -270,6 +270,31 @@ export interface OrderDetail extends Order {
   receivedZec: string;
   depositTxids: string[];
   recipient: string;
+  /** From the vault contract: who approved opening and releasing, and the deadlines. */
+  vault: {
+    contract: string;
+    state: string;
+    approvers: string[];
+    releaseApprovals: string[];
+    releaseDeadline: string | null;
+  } | null;
+  events: NetworkEvent[];
+}
+
+export interface AccountStatus {
+  accountId: string;
+  exists: boolean;
+  registered: boolean;
+  balance: string | null;
+  symbol: string;
+}
+
+export interface FaucetInfo {
+  enabled: boolean;
+  network: string;
+  dripAmount: number;
+  symbol: string | null;
+  token: string | null;
 }
 
 export interface Overview {

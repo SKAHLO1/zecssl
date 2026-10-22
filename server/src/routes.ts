@@ -3,9 +3,10 @@ import { config } from "./config.js";
 import { errorMessage, HttpError } from "./http.js";
 import { fetchChart } from "./sources/coingecko.js";
 import { quote } from "./sources/intents.js";
+import { accountStatus, drip, faucetEnabled, register } from "./sources/faucet.js";
 import { coordinatorQuote, createOrder, orderDetail } from "./sources/network.js";
 import { store } from "./store.js";
-import type { ChartRange, NetworkSnapshot, Overview, QuoteRequest, StreamTopic } from "./types.js";
+import type { ChartRange, FaucetInfo, NetworkSnapshot, Overview, QuoteRequest, StreamTopic } from "./types.js";
 
 const ranges: ChartRange[] = ["1D", "7D", "30D", "1Y"];
 
@@ -73,6 +74,29 @@ export async function routes(app: FastifyInstance) {
       return coordinatorQuote(body.amount);
     }
     return quote(body, store.state.intents);
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/accounts/:id", async (req) => accountStatus(req.params.id));
+
+  app.get("/v1/faucet", async (): Promise<FaucetInfo> => {
+    const token = store.state.network?.vaultToken;
+    return {
+      enabled: faucetEnabled(),
+      network: config.nearNetwork,
+      dripAmount: 100,
+      symbol: token?.symbol ?? null,
+      token: token?.contractAddress ?? null,
+    };
+  });
+
+  app.post<{ Body: { accountId?: string } }>("/v1/faucet/register", async (req) => {
+    if (typeof req.body?.accountId !== "string") throw new HttpError(400, "accountId is required");
+    return register(req.body.accountId.trim());
+  });
+
+  app.post<{ Body: { accountId?: string } }>("/v1/faucet/usdc", async (req) => {
+    if (typeof req.body?.accountId !== "string") throw new HttpError(400, "accountId is required");
+    return drip(req.body.accountId.trim(), req.ip);
   });
 
   app.get<{ Params: { id: string } }>("/v1/orders/:id", async (req) => {

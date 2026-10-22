@@ -2,15 +2,17 @@
 
 import { ArrowDownUp, ArrowLeft, ArrowRight, Check, CircleAlert, Copy, LoaderCircle } from "lucide-react";
 import Image from "next/image";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import { DepositQr } from "@/components/deposit-qr";
 import { OrderBadge } from "@/components/network";
 import { TokenBadge, TokenSelect } from "@/components/token-select";
 import { buttonClass, Card, cx, Mono, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
 import { chainName, duration, token, usd } from "@/lib/format";
 import { useLive } from "@/lib/live";
-import type { IntentsToken, OrderDetail, Quote } from "@/lib/types";
+import type { AccountStatus, IntentsToken, OrderDetail, Quote } from "@/lib/types";
 import { useDestinations, useQuote } from "@/lib/use-quote";
 
 const steps = ["Details", "Review", "Deposit", "Settled"] as const;
@@ -86,6 +88,58 @@ function validRefund(addr: string): string | null {
   if (/^(t1|t3|tm|t2)/.test(addr)) return "Transparent addresses are not accepted. Use a shielded unified address (u1…).";
   if (!/^(u1|utest1)[0-9a-z]{60,}$/.test(addr)) return "Enter a unified address starting with u1 (or utest1 on testnet).";
   return null;
+}
+
+/**
+ * Payouts in the vault's token reach an account only if it is registered with the token;
+ * otherwise they wait as claimable. Checks as the user types and offers the faucet's
+ * one-click registration on testnet.
+ */
+function RecipientCheck({ account }: { account: string }) {
+  const [status, setStatus] = useState<AccountStatus | null>(null);
+  const [faucet, setFaucet] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setStatus(null);
+    setError(null);
+    if (!account) return;
+    const t = setTimeout(() => {
+      api.account(account).then(setStatus).catch((e: Error) => setError(e.message));
+    }, 400);
+    return () => clearTimeout(t);
+  }, [account]);
+  useEffect(() => {
+    api.faucet().then((f) => setFaucet(f.enabled)).catch(() => setFaucet(false));
+  }, []);
+  if (error) return <span className="mt-1 block text-xs text-down">{error}</span>;
+  if (!status) return null;
+  if (!status.exists) return <span className="mt-1 block text-xs text-down">This NEAR account does not exist.</span>;
+  if (status.registered) return <span className="mt-1 block text-xs text-up">Ready to receive {status.symbol}.</span>;
+  return (
+    <span className="mt-1 flex flex-wrap items-center gap-2 text-xs text-warn">
+      Not registered with {status.symbol} yet, so the payout would wait until you claim it.
+      {faucet && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              setStatus((await api.faucetRegister(account)).status);
+            } catch (e) {
+              setError((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+          className="rounded-full bg-forest px-2.5 py-0.5 font-semibold text-[#f5f1e6] disabled:opacity-50"
+        >
+          {busy ? "Registering…" : "Register it"}
+        </button>
+      )}
+    </span>
+  );
 }
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -235,7 +289,11 @@ function SwapFlow() {
                   placeholder={dest?.blockchain === "near" ? "alice.near" : "Destination address"}
                   className="mt-1.5 w-full rounded-xl border border-line bg-surface px-3.5 py-2.5 font-mono text-sm outline-none focus:border-forest focus:ring-2 focus:ring-forest-100"
                 />
-                {touched && recipientError && <span className="mt-1 block text-xs text-down">{recipientError}</span>}
+                {touched && recipientError ? (
+                  <span className="mt-1 block text-xs text-down">{recipientError}</span>
+                ) : (
+                  dest?.assetId.startsWith("vault:") && !recipientError && <RecipientCheck account={recipient.trim()} />
+                )}
               </label>
               <label className="block">
                 <span className="text-sm font-medium">Shielded refund address</span>
@@ -332,7 +390,9 @@ function SwapFlow() {
             </div>
             {step === 2 && (
               <div className="mt-5 space-y-4">
-                <div className="rounded-2xl border border-line p-5">
+                <div className="flex flex-col gap-5 rounded-2xl border border-line p-5 sm:flex-row">
+                  {order.zip321 && <DepositQr uri={order.zip321} />}
+                  <div className="min-w-0 flex-1">
                   <div className="text-sm font-semibold">
                     Send exactly {order.amountZec ?? token(quote?.amountIn)} ZEC from a shielded wallet to
                   </div>
@@ -366,6 +426,10 @@ function SwapFlow() {
                   <p className="mt-3 text-xs text-ink-3">
                     The address is unique to this order. Send from a shielded (u…) address only; this deposit never touches a transparent address.
                   </p>
+                  <Link href={`/app/orders/${order.id}`} className="mt-3 inline-flex text-sm font-medium text-forest hover:underline">
+                    Order page: track it or share it
+                  </Link>
+                  </div>
                 </div>
                 <div className="rounded-2xl bg-sunken/60 p-5">
                   <div className="flex items-center gap-2 text-sm font-semibold">

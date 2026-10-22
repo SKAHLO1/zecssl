@@ -1,6 +1,7 @@
 "use client";
 
 import { CircleAlert, Repeat, Server, Signature, TriangleAlert } from "lucide-react";
+import Link from "next/link";
 import { ago, num, shortHash, token, usd } from "@/lib/format";
 import { useLive, useNow } from "@/lib/live";
 import type { NetworkEvent, Order, OrderState } from "@/lib/types";
@@ -111,7 +112,9 @@ export function OrdersTable({ orders, limit }: { orders: Order[]; limit?: number
           {rows.map((o) => (
             <tr key={o.id} className="border-b border-line last:border-0">
               <td className="py-3 pr-4">
-                <Mono>{shortHash(o.id, 8, 4)}</Mono>
+                <Link href={`/app/orders/${encodeURIComponent(o.id)}`} className="text-forest hover:underline">
+                  <Mono>{shortHash(o.id, 8, 4)}</Mono>
+                </Link>
               </td>
               <td className="py-3 pr-4">{o.direction === "zec_to_near" ? `ZEC → ${o.destinationSymbol}` : `${o.destinationSymbol} → ZEC`}</td>
               <td className="tnum py-3 pr-4 text-right">

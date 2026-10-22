@@ -1,4 +1,4 @@
-import type { ChartRange, OrderDetail, Overview, PriceChart, Quote, QuoteRequest } from "./types";
+import type { AccountStatus, ChartRange, FaucetInfo, OrderDetail, Overview, PriceChart, Quote, QuoteRequest } from "./types";
 
 /** Base URL the browser uses. */
 export const publicApiUrl = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(/\/$/, "");
@@ -29,6 +29,20 @@ export const api = {
   quote: (req: QuoteRequest) =>
     call<Quote>("/v1/quote", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(req) }),
   order: (id: string) => call<OrderDetail>(`/v1/orders/${encodeURIComponent(id)}`),
+  account: (id: string) => call<AccountStatus>(`/v1/accounts/${encodeURIComponent(id)}`),
+  faucet: () => call<FaucetInfo>("/v1/faucet"),
+  faucetRegister: (accountId: string) =>
+    call<{ txHash: string | null; status: AccountStatus }>("/v1/faucet/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ accountId }),
+    }),
+  faucetUsdc: (accountId: string) =>
+    call<{ txHash: string; amount: number; status: AccountStatus }>("/v1/faucet/usdc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ accountId }),
+    }),
   createOrder: (body: unknown) =>
     call<unknown>("/v1/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
 };

@@ -357,9 +357,29 @@ export async function coordinatorQuote(amountZec: string): Promise<Quote> {
   };
 }
 
+/** The coordinator's view of an order, plus its on-chain record and event history. */
 export async function orderDetail(id: string): Promise<OrderDetail> {
-  const { data } = await fetchJson<OrderDetail>(`${config.coordinatorUrl}/v1/orders/${encodeURIComponent(id)}`, { timeoutMs: 10_000 });
-  return data;
+  const base = `${config.coordinatorUrl}/v1/orders/${encodeURIComponent(id)}`;
+  const [{ data }, events, onChain] = await Promise.all([
+    fetchJson<Omit<OrderDetail, "vault" | "events">>(base, { timeoutMs: 10_000 }),
+    fetchJson<NetworkEvent[]>(`${base}/events`, { timeoutMs: 10_000 }).then((r) => r.data).catch(() => []),
+    config.nearVaultContract
+      ? viewCall<ContractOrder & { release_deadline: string }>(config.nearVaultContract, "get_order", { order_id: id }).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  return {
+    ...data,
+    events,
+    vault: onChain
+      ? {
+          contract: config.nearVaultContract,
+          state: onChain.state,
+          approvers: onChain.approvers,
+          releaseApprovals: onChain.release_approvals,
+          releaseDeadline: onChain.release_deadline !== "0" ? nsToIso(onChain.release_deadline) : null,
+        }
+      : null,
+  };
 }
 
 /** Forwards an order request to the coordinator, which owns quoting and deposit addresses. */
