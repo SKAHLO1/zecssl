@@ -6,6 +6,7 @@ import type {
   NetworkSnapshot,
   Operator,
   Order,
+  OrderState,
   SigningRound,
   TreasuryState,
   VaultAccount,
@@ -14,8 +15,10 @@ import { fetchAccount, viewCall } from "./near.js";
 
 /*
  * ZEC SSL's own services. Each is optional until deployed: the coordinator (orders,
- * signing rounds, treasury scan), the operator nodes (health), and the NEAR vault and
- * bond contracts. Unconfigured parts are reported as such, never filled in.
+ * signing rounds, treasury scan), the operator nodes (health), and the NEAR contract
+ * (vault, bonds, orders; contracts/ssl). Unconfigured parts are reported as such, never
+ * filled in. The contract is the source of truth for bonds and order state; the
+ * coordinator adds what only it knows (signing rounds, the shielded side).
  */
 
 interface OperatorHealth {
@@ -29,16 +32,32 @@ interface OperatorHealth {
 
 const lastSeen = new Map<string, string>();
 
+function blankOperator(id: string, name: string, endpoint: string, state: Operator["state"]): Operator {
+  return {
+    id,
+    name,
+    endpoint,
+    state,
+    latencyMs: null,
+    version: null,
+    nearAccount: null,
+    bondUsd: null,
+    active: null,
+    equivocations: null,
+    slashedUsd: null,
+    signaturesTotal: null,
+    lastSignatureAt: null,
+    lastSeen: null,
+  };
+}
+
 async function pollOperator(op: { id: string; name: string; url: string }): Promise<Operator> {
   try {
     const { data, latencyMs } = await fetchJson<OperatorHealth>(`${op.url}/health`, { timeoutMs: 4_000 });
     const now = new Date().toISOString();
     lastSeen.set(op.id, now);
     return {
-      id: op.id,
-      name: op.name,
-      endpoint: op.url,
-      state: data.status === "degraded" ? "degraded" : "online",
+      ...blankOperator(op.id, op.name, op.url, data.status === "degraded" ? "degraded" : "online"),
       latencyMs,
       version: data.version ?? null,
       nearAccount: data.nearAccount ?? null,
@@ -48,19 +67,7 @@ async function pollOperator(op: { id: string; name: string; url: string }): Prom
       lastSeen: now,
     };
   } catch {
-    return {
-      id: op.id,
-      name: op.name,
-      endpoint: op.url,
-      state: "offline",
-      latencyMs: null,
-      version: null,
-      nearAccount: null,
-      bondUsd: null,
-      signaturesTotal: null,
-      lastSignatureAt: null,
-      lastSeen: lastSeen.get(op.id) ?? null,
-    };
+    return { ...blankOperator(op.id, op.name, op.url, "offline"), lastSeen: lastSeen.get(op.id) ?? null };
   }
 }
 
@@ -84,34 +91,156 @@ async function pollCoordinator() {
   };
 }
 
+// ---------- NEAR contract (contracts/ssl) ----------
+
+interface ContractConfig {
+  token: string;
+  token_symbol: string;
+  token_decimals: number;
+  threshold: number;
+}
+
+interface ContractOperator {
+  account_id: string;
+  active: boolean;
+  bond: string;
+  unbonding: string;
+  slashed: string;
+  equivocations: number;
+}
+
+interface ContractOrder {
+  id: string;
+  direction: "zec_to_near" | "near_to_zec";
+  state: string;
+  terms: { recipient: string; amount_out: string; zec_amount_zat: string; deposit_deadline: string };
+  approvers: string[];
+  release_approvals: string[];
+  refund_approvals: string[];
+  created_at: string;
+  opened_at: string;
+  closed_at: string;
+  claimed_at: string;
+}
+
+const orderStates: Record<string, OrderState> = {
+  proposed: "quoted",
+  open: "awaiting_deposit",
+  released: "released",
+  refunded: "refunded",
+  expired: "expired",
+  disputed: "disputed",
+  compensated: "compensated",
+  locked: "locked",
+  claimed: "claimed",
+  challenged: "disputed",
+  settled: "settled",
+  reimbursed: "reimbursed",
+};
+
+const nsToIso = (ns: string) => new Date(Number(BigInt(ns) / 1_000_000n)).toISOString();
+const units = (raw: string, decimals: number) => Number(raw) / 10 ** decimals;
+
+function mapOrder(o: ContractOrder, cfg: ContractConfig): Order {
+  // Show progress toward whichever threshold the order is waiting on.
+  const signatures = o.state === "open" ? o.release_approvals.length : o.approvers.length;
+  const last = [o.closed_at, o.claimed_at, o.opened_at, o.created_at].find((t) => t !== "0") ?? o.created_at;
+  return {
+    id: o.id,
+    direction: o.direction,
+    state: orderStates[o.state] ?? "quoted",
+    amountInZec: String(Number(o.terms.zec_amount_zat) / 1e8),
+    amountOut: String(units(o.terms.amount_out, cfg.token_decimals)),
+    destinationSymbol: cfg.token_symbol,
+    signatures,
+    threshold: cfg.threshold,
+    createdAt: nsToIso(o.created_at),
+    updatedAt: nsToIso(last),
+    nearTxHash: null,
+  };
+}
+
 async function pollContracts() {
   let vault: VaultAccount | null = null;
   let bonds: VaultAccount | null = null;
+  let latencyMs = 0;
   let liquidity: TreasuryState["vaultLiquidity"] = [];
   let totalBondedUsd: number | null = null;
-  let latencyMs = 0;
+  let reserves: TreasuryState["reserves"] = null;
+  let operators: ContractOperator[] = [];
+  let orders: Order[] = [];
+  let cfg: ContractConfig | null = null;
 
   if (config.nearVaultContract) {
     const res = await fetchAccount(config.nearVaultContract);
     vault = res.account;
     latencyMs = res.latencyMs;
-    if (vault.exists) liquidity = (await viewCall<TreasuryState["vaultLiquidity"]>(vault.contract, "get_liquidity")) ?? [];
+    if (vault.exists) {
+      const id = vault.contract;
+      const [liq, bonded, conf, ops, ords, acct] = await Promise.all([
+        viewCall<TreasuryState["vaultLiquidity"]>(id, "get_liquidity"),
+        viewCall<{ usd: number }>(id, "get_total_bonded"),
+        viewCall<ContractConfig>(id, "get_config"),
+        viewCall<ContractOperator[]>(id, "get_operators"),
+        viewCall<ContractOrder[]>(id, "get_orders", { limit: 50 }),
+        viewCall<Record<string, string>>(id, "get_accounting"),
+      ]);
+      liquidity = liq ?? [];
+      totalBondedUsd = bonded?.usd ?? null;
+      cfg = conf;
+      operators = ops ?? [];
+      if (cfg) {
+        const c = cfg;
+        orders = (ords ?? []).map((o) => mapOrder(o, c));
+        if (acct) {
+          // What the token contract says the vault holds, to check the books against.
+          const held = await viewCall<string>(c.token, "ft_balance_of", { account_id: id });
+          reserves = {
+            ...(Object.fromEntries(Object.entries(acct).map(([k, v]) => [k, units(v, c.token_decimals)])) as NonNullable<TreasuryState["reserves"]>),
+            held: held == null ? null : units(held, c.token_decimals),
+          };
+        }
+      }
+    }
   }
-  if (config.nearBondsContract) {
+  // Bonds live in the vault contract; a separate bonds contract is only read if configured.
+  if (config.nearBondsContract && config.nearBondsContract !== config.nearVaultContract) {
     const res = await fetchAccount(config.nearBondsContract);
     bonds = res.account;
     latencyMs = Math.max(latencyMs, res.latencyMs);
-    if (bonds.exists) totalBondedUsd = (await viewCall<{ usd: number }>(bonds.contract, "get_total_bonded"))?.usd ?? null;
+    if (bonds.exists && totalBondedUsd == null) totalBondedUsd = (await viewCall<{ usd: number }>(bonds.contract, "get_total_bonded"))?.usd ?? null;
+  } else {
+    bonds = vault;
   }
-  return { vault, bonds, liquidity, totalBondedUsd, latencyMs };
+  return { vault, bonds, liquidity, totalBondedUsd, reserves, operators, orders, cfg, latencyMs };
+}
+
+/** Contract operators, enriched with health where an endpoint reports the same NEAR account. */
+function mergeOperators(health: Operator[], onChain: ContractOperator[], decimals: number): Operator[] {
+  if (!onChain.length) return health;
+  const used = new Set<string>();
+  const merged = onChain.map((c) => {
+    const h = health.find((o) => o.nearAccount === c.account_id || o.name === c.account_id || o.id === c.account_id);
+    if (h) used.add(h.id);
+    const base = h ?? blankOperator(c.account_id, c.account_id, "", "unmonitored");
+    return {
+      ...base,
+      nearAccount: c.account_id,
+      bondUsd: units(c.bond, decimals) + units(c.unbonding, decimals),
+      active: c.active,
+      equivocations: c.equivocations,
+      slashedUsd: units(c.slashed, decimals),
+    };
+  });
+  return [...merged, ...health.filter((o) => !used.has(o.id))];
 }
 
 export async function pollNetwork(): Promise<NetworkSnapshot> {
   const prev = store.state.network;
 
-  const operators = await Promise.all(config.operators.map(pollOperator));
+  const health = await Promise.all(config.operators.map(pollOperator));
   if (config.operators.length) {
-    const up = operators.filter((o) => o.state !== "offline");
+    const up = health.filter((o) => o.state !== "offline");
     if (up.length) store.succeeded("operators", Math.max(...up.map((o) => o.latencyMs ?? 0)));
     else store.failed("operators", "no operator reachable");
   }
@@ -122,17 +251,12 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
     online: false,
     latencyMs: null,
   };
-  let orders = prev?.orders ?? [];
-  let rounds = prev?.rounds ?? [];
-  let events = prev?.events ?? [];
-  let scan: Pick<TreasuryState, "shieldedBalanceZat" | "addressesIssued" | "lastScanHeight"> | null = null;
+  let coordinatorData: Awaited<ReturnType<typeof pollCoordinator>> | null = null;
   if (config.coordinatorUrl) {
     try {
-      const res = await pollCoordinator();
-      ({ orders, rounds, events } = res);
-      scan = res.treasury;
-      coordinator = { ...coordinator, online: true, latencyMs: res.latencyMs };
-      store.succeeded("coordinator", res.latencyMs);
+      coordinatorData = await pollCoordinator();
+      coordinator = { ...coordinator, online: true, latencyMs: coordinatorData.latencyMs };
+      store.succeeded("coordinator", coordinatorData.latencyMs);
     } catch (err) {
       store.failed("coordinator", errorMessage(err));
     }
@@ -148,9 +272,16 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
     }
   }
 
+  const decimals = contracts?.cfg?.token_decimals ?? 6;
+  const operators = mergeOperators(health, contracts?.operators ?? [], decimals);
+  // The coordinator knows more about each order (deposit detection, signing); without it,
+  // the contract's orders are still the authoritative state.
+  const orders = coordinatorData?.orders ?? contracts?.orders ?? prev?.orders ?? [];
+  const scan = coordinatorData?.treasury ?? null;
   const hasTreasury = scan || contracts;
+
   return {
-    threshold: config.threshold,
+    threshold: contracts?.cfg ? { t: contracts.cfg.threshold, n: Math.max(contracts.operators.length, contracts.cfg.threshold) } : config.threshold,
     coordinator,
     operators,
     vault: contracts?.vault ?? prev?.vault ?? null,
@@ -162,11 +293,12 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
           lastScanHeight: scan?.lastScanHeight ?? null,
           vaultLiquidity: contracts?.liquidity ?? [],
           totalBondedUsd: contracts?.totalBondedUsd ?? null,
+          reserves: contracts?.reserves ?? null,
         }
       : (prev?.treasury ?? null),
     orders,
-    rounds,
-    events,
+    rounds: coordinatorData?.rounds ?? prev?.rounds ?? [],
+    events: coordinatorData?.events ?? prev?.events ?? [],
     updatedAt: new Date().toISOString(),
   };
 }

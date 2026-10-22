@@ -1,0 +1,13 @@
+[package]
+name = "zec-ssl-test-token"
+version = "0.1.0"
+description = "Testnet-only NEP-141 stand-in for USDC, with a capped public faucet"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk.workspace = true
+near-contract-standards.workspace = true

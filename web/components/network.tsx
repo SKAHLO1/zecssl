@@ -16,6 +16,11 @@ const orderTone: Record<OrderState, Parameters<typeof Badge>[0]["tone"]> = {
   refunded: "warn",
   expired: "neutral",
   disputed: "down",
+  compensated: "warn",
+  locked: "neutral",
+  claimed: "gold",
+  settled: "up",
+  reimbursed: "warn",
 };
 
 const orderLabel: Record<OrderState, string> = {
@@ -28,6 +33,11 @@ const orderLabel: Record<OrderState, string> = {
   refunded: "Refunded",
   expired: "Expired",
   disputed: "Disputed",
+  compensated: "Compensated",
+  locked: "Escrowed",
+  claimed: "Claimed",
+  settled: "Settled",
+  reimbursed: "Reimbursed",
 };
 
 export function OrderBadge({ state }: { state: OrderState }) {
@@ -62,11 +72,12 @@ export function OrdersTable({ orders, limit }: { orders: Order[]; limit?: number
   const now = useNow();
   const { network } = useLive();
   const rows = limit ? orders.slice(0, limit) : orders;
-  if (!network.coordinator.online) return <CoordinatorEmpty what="Orders" />;
+  // Orders come from the coordinator, or straight from the vault contract without it.
+  if (!network.coordinator.online && !network.vault?.exists) return <CoordinatorEmpty what="Orders" />;
   if (!rows.length) {
     return (
       <EmptyState icon={<Repeat className="size-5" />} title="No orders yet">
-        The coordinator is online. New swaps will show up here as they are quoted.
+        New swaps will show up here as soon as operators approve them.
       </EmptyState>
     );
   }
@@ -197,8 +208,10 @@ export function OperatorsTable() {
               </td>
               <td className="py-3 pr-4">
                 <span className="inline-flex items-center gap-2">
-                  <StatusDot state={o.state === "online" ? "ok" : o.state === "degraded" ? "warn" : "down"} />
+                  <StatusDot state={o.state === "online" ? "ok" : o.state === "degraded" ? "warn" : o.state === "unmonitored" ? "off" : "down"} />
                   <span className="capitalize">{o.state}</span>
+                  {o.active === false && <Badge tone="warn">Removed</Badge>}
+                  {(o.equivocations ?? 0) > 0 && <Badge tone="down">{o.equivocations} equivocation{o.equivocations === 1 ? "" : "s"}</Badge>}
                 </span>
               </td>
               <td className="tnum py-3 pr-4 text-right">{usd(o.bondUsd)}</td>

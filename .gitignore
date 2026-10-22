@@ -6,3 +6,5 @@ dist
 *.tsbuildinfo
 next-env.d.ts
 protocol/target
+contracts/res
+contracts/target

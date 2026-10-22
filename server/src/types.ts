@@ -148,7 +148,8 @@ export interface Quote {
   quotedAt: string;
 }
 
-export type OperatorState = "online" | "degraded" | "offline";
+/** "unmonitored": known from the contract, but no health endpoint is configured for it. */
+export type OperatorState = "online" | "degraded" | "offline" | "unmonitored";
 
 export interface Operator {
   id: string;
@@ -157,9 +158,13 @@ export interface Operator {
   state: OperatorState;
   latencyMs: number | null;
   version: string | null;
-  /** fields below come from the operator's /health response when it reports them */
+  /** fields below come from the operator's /health response or the NEAR contract */
   nearAccount: string | null;
   bondUsd: number | null;
+  /** from the NEAR contract */
+  active: boolean | null;
+  equivocations: number | null;
+  slashedUsd: number | null;
   signaturesTotal: number | null;
   lastSignatureAt: string | null;
   lastSeen: string | null;
@@ -174,7 +179,13 @@ export type OrderState =
   | "released"
   | "refunded"
   | "expired"
-  | "disputed";
+  | "disputed"
+  | "compensated"
+  // direction 2
+  | "locked"
+  | "claimed"
+  | "settled"
+  | "reimbursed";
 
 export interface Order {
   id: string;
@@ -216,6 +227,15 @@ export interface TreasuryState {
   lastScanHeight: number | null;
   vaultLiquidity: { symbol: string; amount: string }[];
   totalBondedUsd: number | null;
+  /**
+   * The contract's own books, in token units, plus `held`: the vault's balance as the
+   * token contract reports it. `held` must equal `total` (a live reserve check).
+   */
+  reserves:
+    | (Record<"liquidity" | "reserved" | "available" | "escrowed" | "bonded" | "unbonding" | "insurance" | "challenge_bonds" | "claimable" | "total" | "in_flight" | "max_in_flight", number> & {
+        held: number | null;
+      })
+    | null;
 }
 
 export interface VaultAccount {

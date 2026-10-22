@@ -68,11 +68,82 @@ export default function TreasuryPage() {
         <ContractCard title="Bond contract" account={network.bonds} envVar="NEAR_BONDS_CONTRACT" />
       </div>
 
-      <Card title="Reserve attestations">
-        <EmptyState icon={<FileCheck className="size-5" />} title="Attestations start at mainnet beta">
-          Operators will publish periodic reserve attestations so anyone can verify solvency without seeing individual flows (FR-17).
+      <ReserveCheck />
+    </div>
+  );
+}
+
+/**
+ * The vault's own books against what the token contract says it holds. Every token the
+ * contract holds belongs to exactly one bucket, so the two totals must match.
+ */
+function ReserveCheck() {
+  const { network } = useLive();
+  const r = network.treasury?.reserves;
+  const symbol = network.treasury?.vaultLiquidity[0]?.symbol ?? "";
+  if (!r) {
+    return (
+      <Card title="Reserve check">
+        <EmptyState icon={<FileCheck className="size-5" />} title="Waiting for the vault contract">
+          Once <Mono>NEAR_VAULT_CONTRACT</Mono> points at a deployed vault, this compares its books with the token balance it actually holds, live.
         </EmptyState>
       </Card>
-    </div>
+    );
+  }
+  const balanced = r.held != null && Math.abs(r.held - r.total) < 1e-6;
+  const rows: [string, number, string][] = [
+    ["Liquidity", r.liquidity, "Pays out swaps; includes the reserved amount"],
+    ["Reserved for open orders", r.reserved, "Part of liquidity"],
+    ["Direction-2 escrow", r.escrowed, "User funds awaiting a ZEC payout"],
+    ["Operator bonds", r.bonded, "Slashable"],
+    ["Unbonding", r.unbonding, "Still slashable until unlocked"],
+    ["Insurance", r.insurance, "Slashed funds and forfeited challenge bonds"],
+    ["Challenge bonds", r.challenge_bonds, "Held until a dispute resolves"],
+    ["Claimable", r.claimable, "Payouts waiting for their receiver"],
+  ];
+  return (
+    <Card
+      title="Reserve check"
+      action={
+        r.held == null ? <Badge>Balance unavailable</Badge> : <Badge tone={balanced ? "up" : "down"} dot>{balanced ? "Fully backed" : "Mismatch"}</Badge>
+      }
+    >
+      <div className="grid gap-6 lg:grid-cols-[1fr_280px]">
+        <dl className="divide-y divide-line text-sm">
+          {rows.map(([k, v, note]) => (
+            <div key={k} className="flex items-baseline justify-between gap-4 py-2.5">
+              <dt>
+                <span className="font-medium">{k}</span>
+                <span className="block text-xs text-ink-3">{note}</span>
+              </dt>
+              <dd className="tnum font-medium">
+                {token(v, 2)} {symbol}
+              </dd>
+            </div>
+          ))}
+        </dl>
+        <div className="space-y-3 rounded-xl bg-sunken/60 p-4 text-sm">
+          <div className="flex justify-between">
+            <span className="text-ink-3">Accounted total</span>
+            <span className="tnum font-semibold">{token(r.total, 2)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-ink-3">Held on-chain</span>
+            <span className="tnum font-semibold">{r.held == null ? "—" : token(r.held, 2)}</span>
+          </div>
+          <div className="border-t border-line pt-3">
+            <div className="flex justify-between">
+              <span className="text-ink-3">In flight</span>
+              <span className="tnum font-semibold">{token(r.in_flight, 2)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-ink-3">Bonded capacity</span>
+              <span className="tnum font-semibold">{token(r.max_in_flight, 2)}</span>
+            </div>
+            <p className="mt-2 text-xs text-ink-3">Capacity is the combined bonds of the cheapest quorum of operators. In-flight value can never exceed it.</p>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
