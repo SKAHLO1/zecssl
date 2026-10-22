@@ -7,12 +7,21 @@ interface RpcResponse<T> {
   error?: { name?: string; cause?: { name?: string }; message?: string; data?: string };
 }
 
+/** One JSON-RPC call, retried with backoff when the RPC rate-limits (429) or errors (5xx). */
 async function rpc<T>(method: string, params: unknown) {
-  const { data, latencyMs } = await fetchJson<RpcResponse<T>>(config.nearRpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: "zec-ssl", method, params }),
-  });
+  const body = JSON.stringify({ jsonrpc: "2.0", id: "zec-ssl", method, params });
+  let response: Awaited<ReturnType<typeof fetchJson<RpcResponse<T>>>>;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      response = await fetchJson<RpcResponse<T>>(config.nearRpcUrl, { method: "POST", headers: { "content-type": "application/json" }, body });
+      break;
+    } catch (err) {
+      const retryable = err instanceof HttpError && (err.status === 429 || err.status >= 500);
+      if (!retryable || attempt >= 3) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
+    }
+  }
+  const { data, latencyMs } = response;
   if (data.error) {
     const cause = data.error.cause?.name ?? data.error.name ?? "RPC_ERROR";
     throw new HttpError(400, `${cause}: ${data.error.data ?? data.error.message ?? ""}`.trim());

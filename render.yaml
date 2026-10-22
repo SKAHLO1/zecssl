@@ -1,0 +1,157 @@
+# Render Blueprint for the ZEC SSL backend (the website deploys to Vercel; see docs/deploy.md).
+#
+#   zec-ssl-api            public web service: the API the website calls
+#   zec-ssl-coordinator    private service + disk: quotes, orders, treasury view
+#   zec-ssl-operator-1..3  private services + disks: one per operator, each with its own key
+#
+# Private services are reachable only from other services in this Render account. Values
+# marked `sync: false` are secrets or per-deployment settings that Render asks for when the
+# Blueprint is first applied; nothing secret is committed here. Persistent disks need a paid
+# instance type, and the services must not sleep (they watch the chain continuously), so
+# none of them can run on the free plan.
+
+envVarGroups:
+  - name: zec-ssl-protocol
+    envVars:
+      - key: ZCASH_NETWORK
+        value: test
+      - key: LIGHTWALLETD_URL
+        value: https://testnet.zec.rocks:443
+      - key: NEAR_RPC_URL
+        value: https://rpc.testnet.fastnear.com
+      - key: NEAR_VAULT_CONTRACT
+        sync: false
+      # The treasury's unified full viewing key. Grants viewing, not spending; still secret.
+      - key: TREASURY_UFVK
+        sync: false
+      # Block height the treasury wallet scans from on first start.
+      - key: WALLET_BIRTHDAY
+        sync: false
+      - key: CONFIRMATIONS
+        value: "10"
+      # Shared by the coordinator and operators; generated once by Render.
+      - key: OPERATOR_API_TOKEN
+        generateValue: true
+
+services:
+  - type: web
+    name: zec-ssl-api
+    runtime: node
+    plan: starter
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --filter @zec-ssl/server && pnpm --filter @zec-ssl/server build
+    startCommand: node server/dist/index.js
+    healthCheckPath: /v1/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Your Vercel URL(s), comma separated, e.g. https://zec-ssl.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+      - key: TRUST_PROXY
+        value: "true"
+      - key: NEAR_NETWORK
+        value: testnet
+      - key: NEAR_RPC_URL
+        value: https://rpc.testnet.fastnear.com
+      - key: NEAR_VAULT_CONTRACT
+        sync: false
+      - key: COORDINATOR_URL
+        fromService: { type: pserv, name: zec-ssl-coordinator, property: hostport }
+      - key: OPERATOR_1_URL
+        fromService: { type: pserv, name: zec-ssl-operator-1, property: hostport }
+      - key: OPERATOR_2_URL
+        fromService: { type: pserv, name: zec-ssl-operator-2, property: hostport }
+      - key: OPERATOR_3_URL
+        fromService: { type: pserv, name: zec-ssl-operator-3, property: hostport }
+      # Each operator's NEAR account, so the site matches it to the contract while it is down.
+      - key: OPERATOR_1_NAME
+        sync: false
+      - key: OPERATOR_2_NAME
+        sync: false
+      - key: OPERATOR_3_NAME
+        sync: false
+      # Testnet faucet signer (optional): an account holding a little NEAR, and its key.
+      - key: NEAR_FAUCET_ACCOUNT
+        sync: false
+      - key: NEAR_FAUCET_KEY
+        sync: false
+      - key: COINGECKO_API_KEY
+        sync: false
+
+  - type: pserv
+    name: zec-ssl-coordinator
+    runtime: docker
+    plan: starter
+    dockerContext: ./protocol
+    dockerfilePath: ./protocol/Dockerfile
+    dockerCommand: ssl-coordinator
+    disk:
+      name: coordinator-state
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - fromGroup: zec-ssl-protocol
+      - key: OPERATOR_1_URL
+        fromService: { type: pserv, name: zec-ssl-operator-1, property: hostport }
+      - key: OPERATOR_2_URL
+        fromService: { type: pserv, name: zec-ssl-operator-2, property: hostport }
+      - key: OPERATOR_3_URL
+        fromService: { type: pserv, name: zec-ssl-operator-3, property: hostport }
+      - key: SPREAD_BPS
+        value: "25"
+      - key: DEPOSIT_WINDOW_MINS
+        value: "30"
+
+  - type: pserv
+    name: zec-ssl-operator-1
+    runtime: docker
+    plan: starter
+    dockerContext: ./protocol
+    dockerfilePath: ./protocol/Dockerfile
+    dockerCommand: ssl-operator
+    disk:
+      name: operator-1-state
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - fromGroup: zec-ssl-protocol
+      - key: NEAR_ACCOUNT_ID
+        sync: false
+      - key: NEAR_SECRET_KEY
+        sync: false
+
+  - type: pserv
+    name: zec-ssl-operator-2
+    runtime: docker
+    plan: starter
+    dockerContext: ./protocol
+    dockerfilePath: ./protocol/Dockerfile
+    dockerCommand: ssl-operator
+    disk:
+      name: operator-2-state
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - fromGroup: zec-ssl-protocol
+      - key: NEAR_ACCOUNT_ID
+        sync: false
+      - key: NEAR_SECRET_KEY
+        sync: false
+
+  - type: pserv
+    name: zec-ssl-operator-3
+    runtime: docker
+    plan: starter
+    dockerContext: ./protocol
+    dockerfilePath: ./protocol/Dockerfile
+    dockerCommand: ssl-operator
+    disk:
+      name: operator-3-state
+      mountPath: /var/data
+      sizeGB: 2
+    envVars:
+      - fromGroup: zec-ssl-protocol
+      - key: NEAR_ACCOUNT_ID
+        sync: false
+      - key: NEAR_SECRET_KEY
+        sync: false

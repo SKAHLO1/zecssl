@@ -28,8 +28,9 @@ pub struct OrderTerms {
 pub struct Proposal {
     pub order_id: String,
     pub terms: OrderTerms,
-    /// Diversifier index of the deposit address within the treasury viewing key.
-    pub diversifier_index: u32,
+    /// Diversifier index of the deposit address within the treasury viewing key. Random,
+    /// so addresses never repeat even if the coordinator's state is reset.
+    pub diversifier_index: u64,
     pub deposit_address: String,
     /// The ZEC/USD price the coordinator quoted from, for the record.
     pub quoted_zec_usd: f64,
@@ -49,7 +50,7 @@ pub struct Limits {
     /// ...and at most this far out (ns).
     pub max_deposit_window_ns: u64,
     /// Indices below this are reserved (index 0 is the treasury's default address).
-    pub min_diversifier_index: u32,
+    pub min_diversifier_index: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +66,9 @@ pub enum Rejection {
     /// The quote pays out more than the operator's own price allows.
     Overpays { max_amount_out: u128 },
     NoPrice,
+    /// The order id is already on the vault with different terms. Approving would be
+    /// equivocation, which the vault records and arbiters can slash.
+    IdConflict,
 }
 
 impl std::fmt::Display for Rejection {
@@ -80,6 +84,7 @@ impl std::fmt::Display for Rejection {
             Rejection::DeadlineTooFar => f.write_str("deposit deadline is too far out"),
             Rejection::Overpays { max_amount_out } => write!(f, "quote pays out more than this operator's price allows (max {max_amount_out})"),
             Rejection::NoPrice => f.write_str("operator has no current ZEC price"),
+            Rejection::IdConflict => f.write_str("this order id already exists on the vault with different terms"),
         }
     }
 }
@@ -151,6 +156,16 @@ pub fn check_proposal(p: &Proposal, derived_address: &str, own_zec_usd: Option<f
         return Err(Rejection::Overpays { max_amount_out: max });
     }
     Ok(())
+}
+
+/// Checks a proposal against what the vault already holds for that order id. An operator
+/// must never approve different terms for an id that exists: the vault would record it as
+/// equivocation. Identical terms are fine (approving again is a no-op).
+pub fn check_against_vault(p: &Proposal, on_vault: Option<&OrderTerms>) -> Result<(), Rejection> {
+    match on_vault {
+        Some(terms) if *terms != p.terms => Err(Rejection::IdConflict),
+        _ => Ok(()),
+    }
 }
 
 /// A deposit as an operator's wallet reports it.
@@ -298,6 +313,24 @@ mod tests {
         let mut p = proposal();
         p.terms.recipient = "Alice.testnet".into();
         assert_eq!(check_proposal(&p, "utest1abc", Some(1_000.0), NOW, &limits()), Err(Rejection::BadRecipient));
+    }
+
+    #[test]
+    fn an_existing_id_with_other_terms_is_refused() {
+        let p = proposal();
+        assert_eq!(check_against_vault(&p, None), Ok(()));
+        assert_eq!(check_against_vault(&p, Some(&p.terms)), Ok(()));
+        let mut other = p.terms.clone();
+        other.amount_out += 1;
+        assert_eq!(check_against_vault(&p, Some(&other)), Err(Rejection::IdConflict));
+    }
+
+    #[test]
+    fn terms_round_trip_the_contracts_json() {
+        let json = r#"{"recipient":"alice.testnet","amount_out":"498750000","zec_amount_zat":"50000000","deposit_deadline":"1801800000000000000"}"#;
+        let terms: OrderTerms = serde_json::from_str(json).unwrap();
+        assert_eq!(terms.amount_out, 498_750_000);
+        assert_eq!(serde_json::to_string(&terms).unwrap(), json);
     }
 
     #[test]

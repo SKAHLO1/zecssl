@@ -10,11 +10,12 @@
 //! It never trusts the coordinator: a proposal is just a request to check.
 //!
 //! Configuration (environment):
-//!   OPERATOR_LISTEN          127.0.0.1:7101
+//!   OPERATOR_LISTEN          127.0.0.1:7101 (or 0.0.0.0:$PORT when PORT is set)
 //!   OPERATOR_API_TOKEN       bearer token the coordinator must present (required)
 //!   NEAR_RPC_URL             https://rpc.testnet.fastnear.com
 //!   NEAR_VAULT_CONTRACT      the vault account (required)
-//!   NEAR_CREDENTIALS         path to this operator's NEAR CLI credentials file (required)
+//!   NEAR_CREDENTIALS         path to this operator's NEAR CLI credentials file, or
+//!   NEAR_ACCOUNT_ID + NEAR_SECRET_KEY   the account and its ed25519 secret key
 //!   ZCASH_NETWORK            test
 //!   LIGHTWALLETD_URL         https://testnet.zec.rocks:443
 //!   TREASURY_UFVK            the treasury viewing key, or @/path/to/file (required)
@@ -43,7 +44,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ssl_near::Signer;
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, vault::Vault, VERSION};
-use ssl_policy::{check_proposal, deposit_status, DepositStatus, Limits, Proposal, SeenDeposit};
+use ssl_policy::{check_against_vault, check_proposal, deposit_status, DepositStatus, Limits, Proposal, SeenDeposit};
 use ssl_wallet::{derive_address, parse_network, TreasuryWallet};
 use tokio::sync::Mutex;
 
@@ -57,6 +58,7 @@ struct Node {
     confirmations: u32,
     token: String,
     status: Mutex<Status>,
+    bond_cache: Mutex<Option<(Option<f64>, std::time::Instant)>>,
 }
 
 #[derive(Default)]
@@ -96,7 +98,10 @@ impl Node {
             derived
         };
         let price = self.prices.zec_usd().await;
-        if let Err(rejection) = check_proposal(&p, &derived, price, now_ns(), &self.limits) {
+        // Never approve different terms for an id the vault already has: that is equivocation.
+        let existing = self.vault.order(&p.order_id).await.map_err(internal)?;
+        let checked = check_proposal(&p, &derived, price, now_ns(), &self.limits).and_then(|()| check_against_vault(&p, existing.as_ref().map(|o| &o.terms)));
+        if let Err(rejection) = checked {
             tracing::warn!(order = %p.order_id, %rejection, "rejected proposal");
             return Err((StatusCode::UNPROCESSABLE_ENTITY, rejection.to_string()));
         }
@@ -229,7 +234,7 @@ impl Node {
 
     async fn health(&self) -> Value {
         let (tip, scanned) = self.wallet.lock().await.heights().unwrap_or((None, None));
-        let bond = self.vault.operator(&self.signer.account_id).await.ok().flatten();
+        let bond = self.bond_usd().await;
         // Counted from the database so the figure survives restarts.
         let signatures: i64 = {
             let db = self.db.lock().await;
@@ -241,13 +246,30 @@ impl Node {
             "status": if fresh && s.last_error.is_none() { "ok" } else { "degraded" },
             "version": VERSION,
             "nearAccount": self.signer.account_id,
-            "bondUsd": bond.as_ref().and_then(|b| b.bond.parse::<f64>().ok()).map(|v| v / 10f64.powi(self.limits.token_decimals as i32)),
+            "bondUsd": bond,
             "signaturesTotal": signatures,
             "lastSignatureAt": s.last_signature_at.map(ns_to_rfc3339),
             "walletTip": tip,
             "walletScanned": scanned,
             "lastError": s.last_error,
         })
+    }
+
+    /// This operator's bond, refreshed at most once a minute: `/health` is polled often and
+    /// should not cost an RPC call each time.
+    async fn bond_usd(&self) -> Option<f64> {
+        let mut cached = self.bond_cache.lock().await;
+        if let Some((v, at)) = *cached {
+            if at.elapsed() < Duration::from_secs(60) {
+                return v;
+            }
+        }
+        let v = match self.vault.operator(&self.signer.account_id).await {
+            Ok(op) => op.and_then(|b| b.bond.parse::<f64>().ok()).map(|v| v / 10f64.powi(self.limits.token_decimals as i32)),
+            Err(_) => return cached.and_then(|(v, _)| v),
+        };
+        *cached = Some((v, std::time::Instant::now()));
+        v
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
@@ -328,11 +350,14 @@ async fn main() -> Result<()> {
     ssl_node::init_tracing();
     ssl_wallet::install_crypto_provider();
 
-    let listen: SocketAddr = config::opt("OPERATOR_LISTEN", "127.0.0.1:7101").parse()?;
+    let listen: SocketAddr = config::listen_addr("OPERATOR_LISTEN", 7101)?;
     let token = config::req("OPERATOR_API_TOKEN")?;
     anyhow::ensure!(token.len() >= 24, "OPERATOR_API_TOKEN must be at least 24 characters");
     let vault = Vault::new(&config::opt("NEAR_RPC_URL", "https://rpc.testnet.fastnear.com"), &config::req("NEAR_VAULT_CONTRACT")?);
-    let signer = Signer::from_credentials_file(config::req("NEAR_CREDENTIALS")?.as_ref())?;
+    let signer = match (std::env::var("NEAR_ACCOUNT_ID").ok().filter(|v| !v.is_empty()), std::env::var("NEAR_SECRET_KEY").ok().filter(|v| !v.is_empty())) {
+        (Some(account), Some(key)) => Signer::new(account.trim(), key.trim())?,
+        _ => Signer::from_credentials_file(config::req("NEAR_CREDENTIALS")?.as_ref())?,
+    };
     let vault_config = vault.config().await.context("reading the vault config")?;
     let me = vault.operator(&signer.account_id).await?.with_context(|| format!("{} is not an operator on {}", signer.account_id, vault.contract))?;
     anyhow::ensure!(me.active, "{} has been removed as an operator", signer.account_id);
@@ -373,6 +398,7 @@ async fn main() -> Result<()> {
         confirmations: config::num("CONFIRMATIONS", 12)?,
         token,
         status: Mutex::new(Status::default()),
+        bond_cache: Mutex::new(None),
     });
     tracing::info!(account = %node.signer.account_id, vault = %node.vault.contract, %listen, "operator starting");
 

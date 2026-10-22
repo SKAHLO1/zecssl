@@ -10,6 +10,10 @@ zec-ssl/
 
 The web app never calls third-party APIs itself. The server polls every source on a schedule, keeps the latest snapshot in memory, and pushes changes to browsers over Server-Sent Events, so page views never touch upstream rate limits.
 
+## Deploy
+
+Website on Vercel, backend on Render: see [docs/deploy.md](docs/deploy.md) and [render.yaml](render.yaml).
+
 ## Run it
 
 Requires Node 22+ and pnpm 10.

@@ -6,8 +6,9 @@
 //! only it sees (deposits as they arrive) and serves the API the ZEC SSL website uses.
 //!
 //! Configuration (environment):
-//!   COORDINATOR_LISTEN       127.0.0.1:7000
-//!   OPERATORS                name=url pairs, comma separated (required)
+//!   COORDINATOR_LISTEN       127.0.0.1:7000 (or 0.0.0.0:$PORT when PORT is set)
+//!   OPERATORS                name=url pairs, comma separated; or OPERATOR_1_URL /
+//!                            OPERATOR_1_NAME ... OPERATOR_9_URL (host:port is accepted)
 //!   OPERATOR_API_TOKEN       bearer token for the operators (required)
 //!   NEAR_RPC_URL             https://rpc.testnet.fastnear.com
 //!   NEAR_VAULT_CONTRACT      the vault account (required)
@@ -45,7 +46,17 @@ use ssl_policy::{deposit_status, valid_near_account, DepositStatus, OrderTerms, 
 use ssl_wallet::{parse_network, TreasuryWallet};
 use tokio::sync::Mutex;
 
-const INDEX_BASE: u32 = 1_000;
+/// Indices below this are reserved (0 is the treasury's default address).
+const INDEX_MIN: u64 = 1_000;
+
+/// 64 bits from the OS-seeded hasher keys std keeps per thread. Used for uniqueness (order
+/// ids, address indices), not for secrecy.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.finish()
+}
 
 struct Operator {
     name: String,
@@ -232,8 +243,13 @@ impl Coordinator {
             .map_err(internal)?;
             db.last_insert_rowid()
         };
-        let id = format!("zs-{seq}");
-        let index = INDEX_BASE + seq as u32;
+        // Ids and address indices carry randomness, so they never repeat even if this
+        // coordinator's state is lost and the sequence restarts: a reused id would ask
+        // operators to approve new terms for an existing order (equivocation), and a reused
+        // index would hand out an old order's deposit address.
+        let id = format!("zs-{seq}-{:06x}", random_u64() & 0xff_ffff);
+        // 62 bits keeps the index within SQLite's signed 64-bit integers.
+        let index = INDEX_MIN + (random_u64() >> 2);
         let address = self.wallet.lock().await.address(index).map_err(internal)?;
         {
             let db = self.db.lock().await;
@@ -585,15 +601,9 @@ async fn main() -> Result<()> {
     ssl_node::init_tracing();
     ssl_wallet::install_crypto_provider();
 
-    let listen: SocketAddr = config::opt("COORDINATOR_LISTEN", "127.0.0.1:7000").parse()?;
-    let operators: Vec<Operator> = config::req("OPERATORS")?
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|pair| {
-            let (name, url) = pair.split_once('=').ok_or_else(|| anyhow!("OPERATORS entries are name=url"))?;
-            Ok(Operator { name: name.trim().into(), url: url.trim().trim_end_matches('/').into() })
-        })
-        .collect::<Result<_>>()?;
+    let listen: SocketAddr = config::listen_addr("COORDINATOR_LISTEN", 7000)?;
+    let operators: Vec<Operator> = config::endpoints("OPERATORS", "OPERATOR")?.into_iter().map(|(name, url)| Operator { name, url }).collect();
+    anyhow::ensure!(!operators.is_empty(), "set OPERATORS or OPERATOR_1_URL ... OPERATOR_N_URL");
     let vault = Vault::new(&config::opt("NEAR_RPC_URL", "https://rpc.testnet.fastnear.com"), &config::req("NEAR_VAULT_CONTRACT")?);
     let vault_config = vault.config().await.context("reading the vault config")?;
     anyhow::ensure!(operators.len() >= vault_config.threshold as usize, "fewer operator endpoints than the vault threshold");

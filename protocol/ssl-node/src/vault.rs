@@ -18,6 +18,7 @@ pub struct VaultConfig {
 pub struct VaultOrder {
     pub id: String,
     pub state: String,
+    pub terms: OrderTerms,
     pub approvers: Vec<String>,
     pub release_approvals: Vec<String>,
     pub refund_approvals: Vec<String>,

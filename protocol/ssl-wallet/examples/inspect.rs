@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     let mut w = TreasuryWallet::open(a[0].as_ref(), network, &ufvk, &a[2], Some(a[3].parse()?)).await?;
     let started = std::time::Instant::now();
     w.sync().await?;
-    let index: u32 = a[4].parse()?;
+    let index: u64 = a[4].parse()?;
     let addr = w.address(index)?;
     let pure = derive_address(&network, w.ufvk(), index)?;
     println!("synced in {:?}; heights {:?}", started.elapsed(), w.heights()?);

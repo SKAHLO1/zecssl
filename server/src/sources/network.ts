@@ -169,6 +169,9 @@ function mapOrder(o: ContractOrder, cfg: ContractConfig): Order {
   };
 }
 
+const SLOW_REFRESH_MS = 5 * 60_000;
+let slow: { account: VaultAccount; cfg: ContractConfig | null; at: number } | null = null;
+
 async function pollContracts() {
   let vault: VaultAccount | null = null;
   let bonds: VaultAccount | null = null;
@@ -181,34 +184,36 @@ async function pollContracts() {
   let cfg: ContractConfig | null = null;
 
   if (config.nearVaultContract) {
-    const res = await fetchAccount(config.nearVaultContract);
-    vault = res.account;
-    latencyMs = res.latencyMs;
-    if (vault.exists) {
+    // The account and config rarely change; refresh them every few minutes, not every poll.
+    if (!slow || Date.now() - slow.at > SLOW_REFRESH_MS) {
+      const res = await fetchAccount(config.nearVaultContract);
+      const conf = res.account.exists ? await viewCall<ContractConfig>(res.account.contract, "get_config") : null;
+      slow = { account: res.account, cfg: conf, at: Date.now() };
+      latencyMs = res.latencyMs;
+    }
+    vault = slow.account;
+    cfg = slow.cfg;
+    if (vault.exists && cfg) {
       const id = vault.contract;
-      const [liq, bonded, conf, ops, ords, acct] = await Promise.all([
-        viewCall<TreasuryState["vaultLiquidity"]>(id, "get_liquidity"),
-        viewCall<{ usd: number }>(id, "get_total_bonded"),
-        viewCall<ContractConfig>(id, "get_config"),
+      const c = cfg;
+      const [ops, ords, acct] = await Promise.all([
         viewCall<ContractOperator[]>(id, "get_operators"),
         viewCall<ContractOrder[]>(id, "get_orders", { limit: 50 }),
         viewCall<Record<string, string>>(id, "get_accounting"),
       ]);
-      liquidity = liq ?? [];
-      totalBondedUsd = bonded?.usd ?? null;
-      cfg = conf;
       operators = ops ?? [];
-      if (cfg) {
-        const c = cfg;
-        orders = (ords ?? []).map((o) => mapOrder(o, c));
-        if (acct) {
-          // What the token contract says the vault holds, to check the books against.
-          const held = await viewCall<string>(c.token, "ft_balance_of", { account_id: id });
-          reserves = {
-            ...(Object.fromEntries(Object.entries(acct).map(([k, v]) => [k, units(v, c.token_decimals)])) as NonNullable<TreasuryState["reserves"]>),
-            held: held == null ? null : units(held, c.token_decimals),
-          };
-        }
+      orders = (ords ?? []).map((o) => mapOrder(o, c));
+      // Liquidity and total bonds follow from the accounting and the operators, so they
+      // need no calls of their own.
+      totalBondedUsd = operators.reduce((sum, op) => sum + units(op.bond, c.token_decimals) + units(op.unbonding, c.token_decimals), 0);
+      if (acct) {
+        liquidity = [{ symbol: c.token_symbol, amount: String(units(acct.available, c.token_decimals)) }];
+        // What the token contract says the vault holds, to check the books against.
+        const held = await viewCall<string>(c.token, "ft_balance_of", { account_id: id });
+        reserves = {
+          ...(Object.fromEntries(Object.entries(acct).map(([k, v]) => [k, units(v, c.token_decimals)])) as NonNullable<TreasuryState["reserves"]>),
+          held: held == null ? null : units(held, c.token_decimals),
+        };
       }
     }
   }

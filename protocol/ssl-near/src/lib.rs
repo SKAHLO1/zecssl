@@ -143,17 +143,27 @@ impl Near {
         Self { rpc: rpc_url.into(), http: reqwest::Client::new(), nonce_lock: Mutex::new(()) }
     }
 
+    /// One JSON-RPC call, retried with backoff on rate limits (429), server errors and
+    /// connection failures. Retrying `send_tx` is safe: it resends the same signed
+    /// transaction, which has the same hash, so it cannot execute twice.
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
-        let res: Value = self
-            .http
-            .post(&self.rpc)
-            .json(&json!({ "jsonrpc": "2.0", "id": "ssl", "method": method, "params": params }))
-            .timeout(std::time::Duration::from_secs(60))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let body = json!({ "jsonrpc": "2.0", "id": "ssl", "method": method, "params": params });
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 0;
+        let res: Value = loop {
+            attempt += 1;
+            let sent = self.http.post(&self.rpc).json(&body).timeout(std::time::Duration::from_secs(60)).send().await;
+            let retryable = match &sent {
+                Ok(r) => r.status().as_u16() == 429 || r.status().is_server_error(),
+                Err(e) => e.is_connect() || e.is_timeout(),
+            };
+            if retryable && attempt < 6 {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(8));
+                continue;
+            }
+            break sent?.error_for_status()?.json().await?;
+        };
         if let Some(err) = res.get("error") {
             bail!("{method}: {}", err.get("data").or(err.get("cause")).unwrap_or(err));
         }

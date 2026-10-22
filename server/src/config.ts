@@ -8,17 +8,31 @@ function int(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/** Accepts `host:port` (as Render's service references give it) or a full URL. */
+function httpUrl(s: string): string {
+  const t = s.trim().replace(/\/$/, "");
+  return t.includes("://") ? t : `http://${t}`;
+}
+
+/**
+ * Operator health endpoints: `name=url,name=url` in OPERATOR_ENDPOINTS, or numbered
+ * OPERATOR_1_URL / OPERATOR_1_NAME ... OPERATOR_9_URL (one per Render service reference).
+ * Name each endpoint after its NEAR account so it stays matched to the contract while down.
+ */
 function operators(raw: string): { id: string; name: string; url: string }[] {
-  return raw
-    .split(",")
-    .map((pair) => pair.trim())
-    .filter(Boolean)
-    .map((pair, i) => {
-      const eq = pair.indexOf("=");
-      const name = eq > 0 ? pair.slice(0, eq) : `operator-${i + 1}`;
-      const url = (eq > 0 ? pair.slice(eq + 1) : pair).replace(/\/$/, "");
-      return { id: name.toLowerCase(), name, url };
-    });
+  const pairs: [string, string][] = raw
+    ? raw
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((pair, i) => {
+          const eq = pair.indexOf("=");
+          return [eq > 0 ? pair.slice(0, eq) : `operator-${i + 1}`, eq > 0 ? pair.slice(eq + 1) : pair];
+        })
+    : Array.from({ length: 9 }, (_, i) => i + 1)
+        .filter((i) => str(`OPERATOR_${i}_URL`))
+        .map((i) => [str(`OPERATOR_${i}_NAME`, `operator-${i}`), str(`OPERATOR_${i}_URL`)]);
+  return pairs.map(([name, url]) => ({ id: name.toLowerCase(), name, url: httpUrl(url) }));
 }
 
 const nearNetwork = str("NEAR_NETWORK", "testnet");
@@ -38,7 +52,7 @@ export const config = {
   nearVaultContract: str("NEAR_VAULT_CONTRACT"),
   nearBondsContract: str("NEAR_BONDS_CONTRACT"),
 
-  coordinatorUrl: str("COORDINATOR_URL").replace(/\/$/, ""),
+  coordinatorUrl: str("COORDINATOR_URL") ? httpUrl(str("COORDINATOR_URL")) : "",
   operators: operators(str("OPERATOR_ENDPOINTS")),
   threshold: { t: int("THRESHOLD_T", 2), n: int("THRESHOLD_N", 3) },
 
@@ -59,9 +73,9 @@ export const config = {
   intervals: {
     market: 60_000,
     zcash: 30_000,
-    near: 6_000,
+    near: 10_000,
     intents: 60_000,
-    network: 10_000,
+    network: 15_000,
   },
 } as const;
 

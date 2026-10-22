@@ -54,7 +54,7 @@ pub fn parse_ufvk(network: &Network, s: &str) -> Result<UnifiedFullViewingKey> {
 
 /// The shielded deposit address for an order, derived from the viewing key alone. Pure,
 /// so an operator can check a coordinator-supplied address without trusting it.
-pub fn derive_address(network: &Network, ufvk: &UnifiedFullViewingKey, index: u32) -> Result<String> {
+pub fn derive_address(network: &Network, ufvk: &UnifiedFullViewingKey, index: u64) -> Result<String> {
     let ua = ufvk
         .address(DiversifierIndex::from(index), UnifiedAddressRequest::SHIELDED)
         .map_err(|e| anyhow!("no shielded address at diversifier index {index}: {e:?}"))?;
@@ -131,7 +131,7 @@ impl TreasuryWallet {
 
     /// The deposit address for `index`, recorded in the wallet so that notes received at it
     /// are attributed to it.
-    pub fn address(&mut self, index: u32) -> Result<String> {
+    pub fn address(&mut self, index: u64) -> Result<String> {
         let ua = self
             .db
             .get_address_for_index(self.account, DiversifierIndex::from(index), UnifiedAddressRequest::SHIELDED)?
