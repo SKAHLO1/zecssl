@@ -134,6 +134,11 @@ One contract, `ssl.<org>.testnet`, in `near-sdk` (Rust).
 
 **Exit:** sandbox tests cover every method, every revert, the equivocation path and caps. Deployed to testnet with three bonded operator accounts.
 
+> **Status (2026-10-22): built and tested; not yet deployed.** See [contracts/README.md](../contracts/README.md).
+> - 19 unit tests and 5 sandbox tests on the real wasm pass. The sandbox tests check after every step that the contract's token balance equals its accounted total.
+> - The API and website read the contract's operators, bonds, orders and a live reserve check.
+> - Remaining: run `contracts/scripts/deploy-testnet.sh` with your NEAR testnet accounts, then bond three operators.
+
 ### Phase 4 — Coordinator and operator nodes, direction 1
 
 **Coordinator** (Rust, Postgres):
