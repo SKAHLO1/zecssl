@@ -63,7 +63,6 @@ struct Node {
 struct Status {
     last_sync_ok: Option<u64>,
     last_error: Option<String>,
-    signatures: u64,
     last_signature_at: Option<u64>,
 }
 
@@ -126,9 +125,7 @@ impl Node {
         if let Err(e) = db.execute(&sql, params![tx, order]) {
             tracing::error!(error = %e, "recording a signature");
         }
-        let mut s = self.status.lock().await;
-        s.signatures += 1;
-        s.last_signature_at = Some(now_ns());
+        self.status.lock().await.last_signature_at = Some(now_ns());
     }
 
     /// Looks at one order: if it is open on the vault and our own wallet shows it paid,
@@ -233,6 +230,11 @@ impl Node {
     async fn health(&self) -> Value {
         let (tip, scanned) = self.wallet.lock().await.heights().unwrap_or((None, None));
         let bond = self.vault.operator(&self.signer.account_id).await.ok().flatten();
+        // Counted from the database so the figure survives restarts.
+        let signatures: i64 = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT COUNT(approved_tx) + COUNT(release_tx) FROM orders", [], |r| r.get(0)).unwrap_or(0)
+        };
         let s = self.status.lock().await;
         let fresh = s.last_sync_ok.is_some_and(|t| now_ns().saturating_sub(t) < 120_000_000_000);
         json!({
@@ -240,7 +242,7 @@ impl Node {
             "version": VERSION,
             "nearAccount": self.signer.account_id,
             "bondUsd": bond.as_ref().and_then(|b| b.bond.parse::<f64>().ok()).map(|v| v / 10f64.powi(self.limits.token_decimals as i32)),
-            "signaturesTotal": s.signatures,
+            "signaturesTotal": signatures,
             "lastSignatureAt": s.last_signature_at.map(ns_to_rfc3339),
             "walletTip": tip,
             "walletScanned": scanned,

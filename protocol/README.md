@@ -45,7 +45,7 @@ This starts three operators (`:7101`–`:7103`, signing as `<prefix>-op1..3.test
 
 ```
 COORDINATOR_URL=http://127.0.0.1:7000
-OPERATOR_ENDPOINTS=op1=http://127.0.0.1:7101,op2=http://127.0.0.1:7102,op3=http://127.0.0.1:7103
+OPERATOR_ENDPOINTS=<prefix>-op1.testnet=http://127.0.0.1:7101,<prefix>-op2.testnet=http://127.0.0.1:7102,<prefix>-op3.testnet=http://127.0.0.1:7103
 ```
 
 The website's swap then quotes from the coordinator, pays out in the vault's token, and follows each order live.

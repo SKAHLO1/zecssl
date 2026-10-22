@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -167,7 +168,8 @@ impl Coordinator {
             .post(format!("{}{path}", op.url))
             .bearer_auth(&self.token)
             .json(body)
-            .timeout(Duration::from_secs(60))
+            // An approval waits for one NEAR transaction to be final, a few seconds.
+            .timeout(Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| format!("{}: unreachable ({e})", op.name))?;
@@ -229,9 +231,22 @@ impl Coordinator {
             quoted_zec_usd: zec_usd,
         };
         let body = serde_json::to_value(&proposal).map_err(internal)?;
-        let results = join_all(self.operators.iter().map(|op| self.call_operator(op, "/v1/proposals", &body))).await;
-        let approved = results.iter().filter(|r| r.is_ok()).count();
-        let reasons: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+        // Return as soon as the threshold has approved: an operator that is down or hung
+        // must not hold up the order. Requests still in flight are dropped; an operator
+        // that was mid-approval may still land its approval, which the vault accepts.
+        let threshold = self.vault_config.threshold as usize;
+        let mut pending: FuturesUnordered<_> = self.operators.iter().map(|op| self.call_operator(op, "/v1/proposals", &body)).collect();
+        let (mut approved, mut reasons) = (0usize, vec![]);
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(_) => approved += 1,
+                Err(e) => reasons.push(e),
+            }
+            if approved >= threshold {
+                break;
+            }
+        }
+        drop(pending);
 
         let on_chain = self.vault.order(&id).await.map_err(internal)?;
         let open = on_chain.as_ref().is_some_and(|o| o.state == "open");

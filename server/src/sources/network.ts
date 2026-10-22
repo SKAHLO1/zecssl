@@ -33,6 +33,9 @@ interface OperatorHealth {
 }
 
 const lastSeen = new Map<string, string>();
+// The NEAR account each endpoint last reported, so an operator that goes down is still
+// matched to its on-chain entry and shown as offline rather than unmonitored.
+const lastAccount = new Map<string, string>();
 
 function blankOperator(id: string, name: string, endpoint: string, state: Operator["state"]): Operator {
   return {
@@ -58,6 +61,7 @@ async function pollOperator(op: { id: string; name: string; url: string }): Prom
     const { data, latencyMs } = await fetchJson<OperatorHealth>(`${op.url}/health`, { timeoutMs: 4_000 });
     const now = new Date().toISOString();
     lastSeen.set(op.id, now);
+    if (data.nearAccount) lastAccount.set(op.id, data.nearAccount);
     return {
       ...blankOperator(op.id, op.name, op.url, data.status === "degraded" ? "degraded" : "online"),
       latencyMs,
@@ -69,7 +73,10 @@ async function pollOperator(op: { id: string; name: string; url: string }): Prom
       lastSeen: now,
     };
   } catch {
-    return { ...blankOperator(op.id, op.name, op.url, "offline"), lastSeen: lastSeen.get(op.id) ?? null };
+    // An endpoint named after its NEAR account (OPERATOR_ENDPOINTS=<account>=<url>) is
+    // matched even if it has never answered since this API started.
+    const account = lastAccount.get(op.id) ?? (op.name.includes(".") ? op.name : null);
+    return { ...blankOperator(op.id, op.name, op.url, "offline"), nearAccount: account, lastSeen: lastSeen.get(op.id) ?? null };
   }
 }
 
@@ -361,7 +368,8 @@ export async function createOrder(body: unknown) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-    timeoutMs: 15_000,
+    // Opening waits for operators to approve on NEAR (up to 30s for a hung operator).
+    timeoutMs: 45_000,
   });
   return data;
 }

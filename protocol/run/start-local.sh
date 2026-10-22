@@ -58,7 +58,7 @@ done
 
 env "${common[@]}" \
   COORDINATOR_LISTEN=127.0.0.1:7000 \
-  OPERATORS="op1=http://127.0.0.1:7101,op2=http://127.0.0.1:7102,op3=http://127.0.0.1:7103" \
+  OPERATORS="$PREFIX-op1.testnet=http://127.0.0.1:7101,$PREFIX-op2.testnet=http://127.0.0.1:7102,$PREFIX-op3.testnet=http://127.0.0.1:7103" \
   STATE_DIR="$STATE/coordinator" \
   "$BIN/ssl-coordinator" > "$STATE/coordinator.log" 2>&1 &
 pids+=($!)
@@ -66,8 +66,14 @@ echo "coordinator on :7000, log $STATE/coordinator.log"
 echo
 echo "For the website's API (server/.env):"
 echo "  COORDINATOR_URL=http://127.0.0.1:7000"
-echo "  OPERATOR_ENDPOINTS=op1=http://127.0.0.1:7101,op2=http://127.0.0.1:7102,op3=http://127.0.0.1:7103"
+echo "  OPERATOR_ENDPOINTS=$PREFIX-op1.testnet=http://127.0.0.1:7101,$PREFIX-op2.testnet=http://127.0.0.1:7102,$PREFIX-op3.testnet=http://127.0.0.1:7103"
 
-# Exit (and stop the rest) if any process dies.
-wait -n "${pids[@]}"
-echo "a process exited; stopping all"
+# One process exiting must not take the others down: the network is built to keep
+# settling with up to n - t operators offline. Report exits and keep running until
+# Ctrl-C or every process has exited.
+remaining=${#pids[@]}
+while [ "$remaining" -gt 0 ]; do
+  if wait -n "${pids[@]}" 2>/dev/null; then status=0; else status=$?; fi
+  remaining=$((remaining - 1))
+  echo "$(date -u +%H:%M:%S) a process exited (status $status); $remaining still running"
+done
