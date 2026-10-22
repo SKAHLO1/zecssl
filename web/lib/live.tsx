@@ -22,6 +22,7 @@ const emptyNetwork: NetworkSnapshot = {
   orders: [],
   rounds: [],
   events: [],
+  vaultToken: null,
   updatedAt: new Date(0).toISOString(),
 };
 

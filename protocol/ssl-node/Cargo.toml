@@ -1,0 +1,31 @@
+[package]
+name = "ssl-node"
+version = "0.1.0"
+description = "ZEC SSL coordinator and operator node services"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ssl-operator"
+path = "src/bin/operator.rs"
+
+[[bin]]
+name = "ssl-coordinator"
+path = "src/bin/coordinator.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+futures = "0.3"
+hex.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = "0.37"
+serde.workspace = true
+serde_json.workspace = true
+ssl-near = { path = "../ssl-near" }
+ssl-policy = { path = "../ssl-policy" }
+ssl-wallet = { path = "../ssl-wallet" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

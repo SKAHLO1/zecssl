@@ -1,13 +1,62 @@
 # ZEC SSL protocol
 
-Rust code that touches keys and chains. This currently holds the Phase 2 signing spike from [docs/testnet-plan.md](../docs/testnet-plan.md): proving that a 2-of-3 rerandomized FROST key can spend from a shielded treasury on Zcash testnet.
+Rust code that touches keys and chains: the coordinator and operator services (Phase 4), their libraries, and the Phase 2 FROST signing spike from [docs/testnet-plan.md](../docs/testnet-plan.md).
 
 ```
 protocol/
+├── ssl-node/          the services: ssl-coordinator and ssl-operator
+├── ssl-policy/        order types and the checks operators run before approving (pure, tested)
+├── ssl-wallet/        view-only treasury wallet: lightwalletd sync, per-order addresses, deposits
+├── ssl-near/          minimal NEAR client: view calls and signed function calls
 ├── ssl-sign/          prepare a PCZT for external signing, apply and verify signatures, extract the final tx
-├── spike/             end-to-end scripts: frostd, DKG, treasury wallet, 2-of-3 spends
+├── run/               run the services locally against testnet; a throwaway user wallet
+├── spike/             Phase 2: frostd, DKG, treasury wallet, 2-of-3 spends
 └── scripts/           build the pinned upstream tools; build and test ssl-sign
 ```
+
+## Services (direction 1: shielded ZEC → USDC on NEAR)
+
+**Coordinator** (`ssl-coordinator`). It holds no key share and no NEAR key, only the treasury's viewing key.
+- Quotes from its own price feed.
+- Gives each order a fresh shielded deposit address (diversifier index 1000 + order number).
+- Proposes the order to every operator, and returns the deposit address **only once the vault reports the order open**.
+- Tracks deposits and order state, nudges operators once a deposit is paid, and records events.
+- Serves the API the website uses: `/v1/quote`, `/v1/orders`, `/v1/orders/{id}`, `/v1/events`, `/v1/treasury`, `/v1/signing-rounds`, `/health`.
+
+**Operator** (`ssl-operator`). Each runs its own NEAR key, its own wallet and its own price feed, and never trusts the coordinator.
+- **Approving an order:** it approves on the vault only if [`ssl-policy`](ssl-policy/src/lib.rs) passes:
+  - the deposit address is its *own* derivation for the stated index;
+  - the payout doesn't exceed its own ZEC price (after spread, plus tolerance);
+  - the order is within its size and deadline bounds;
+  - the recipient is a valid NEAR account.
+- **Approving a release:** it approves only when its *own* wallet shows the deposit paid in full, at the required depth, and first mined before the deadline. Underpaid or late deposits are flagged for refund and never released.
+- **Health:** `/health` reports its NEAR account, its bond from the contract, signature count, wallet heights and last error. The website shows these on the Operator network page.
+
+The coordinator authenticates to operators with a shared bearer token. That's not what keeps them safe, though: operators re-check every proposal against their own rules.
+
+### Run locally against testnet
+
+```bash
+cd protocol && CARGO_TARGET_DIR=~/zec-ssl-deps/target-protocol cargo build --release -p ssl-node
+VAULT=<prefix>-vault.testnet PREFIX=<prefix> bash protocol/run/start-local.sh
+```
+
+This starts three operators (`:7101`–`:7103`, signing as `<prefix>-op1..3.testnet` from your NEAR CLI keychain) and the coordinator (`:7000`). Each has its own state under `~/zec-ssl-run`. Then set these in `server/.env`:
+
+```
+COORDINATOR_URL=http://127.0.0.1:7000
+OPERATOR_ENDPOINTS=op1=http://127.0.0.1:7101,op2=http://127.0.0.1:7102,op3=http://127.0.0.1:7103
+```
+
+The website's swap then quotes from the coordinator, pays out in the vault's token, and follows each order live.
+
+`run/user-wallet.sh` is a throwaway testnet wallet that plays the user and deposits into orders.
+
+### Not in this phase
+
+- **Refunds** for underpaid or late deposits are FROST-signed Zcash spends (Phase 6). Operators detect and flag them but don't sign them yet.
+- **Direction 2** (USDC → shielded ZEC) is Phase 7.
+- **Independence:** all services share one machine and one lightwalletd here. Production operators run on separate hosts with their own Zebra and Zaino (Phase 8).
 
 ## Build (Linux or WSL)
 

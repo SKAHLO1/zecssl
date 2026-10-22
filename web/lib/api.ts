@@ -1,4 +1,4 @@
-import type { ChartRange, Overview, PriceChart, Quote, QuoteRequest } from "./types";
+import type { ChartRange, OrderDetail, Overview, PriceChart, Quote, QuoteRequest } from "./types";
 
 /** Base URL the browser uses. */
 export const publicApiUrl = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(/\/$/, "");
@@ -28,6 +28,7 @@ export const api = {
   chart: (id: string, range: ChartRange) => call<PriceChart>(`/v1/market/${id}/chart?range=${range}`),
   quote: (req: QuoteRequest) =>
     call<Quote>("/v1/quote", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(req) }),
+  order: (id: string) => call<OrderDetail>(`/v1/orders/${encodeURIComponent(id)}`),
   createOrder: (body: unknown) =>
     call<unknown>("/v1/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
 };

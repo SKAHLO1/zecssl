@@ -165,6 +165,11 @@ One contract, `ssl.<org>.testnet`, in `near-sdk` (Rust).
 
 **Exit:** a full direction-1 swap on testnet, driven only from the website and a normal Zcash wallet. It also settles with any one operator stopped.
 
+> **Status (2026-10-22): direction 1 runs end to end on testnet.** See [protocol/README.md](../protocol/README.md).
+> - Order `zs-1` was opened from the website and approved on the vault by all three operators, each with its own NEAR key.
+> - 0.01 ZEC arrived from a separate user wallet. Operators approved the release after 10 confirmations, and the vault paid 11.994139 test USDC to the recipient, about 8 minutes end to end.
+> - Remaining in this phase: re-run with one operator stopped; refunds (Phase 6); operators on separate hosts with their own Zebra and Zaino (Phase 8).
+
 ### Phase 5 — Website and read API on testnet
 
 - **Network switch:** `NETWORK=testnet` selects the NEAR testnet RPC, our Zebra testnet node and testnet explorers. Panels that can only show mainnet data are labelled as mainnet context.

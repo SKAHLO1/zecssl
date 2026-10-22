@@ -1,12 +1,14 @@
 import { config } from "../config.js";
-import { errorMessage, fetchJson } from "../http.js";
+import { errorMessage, fetchJson, HttpError } from "../http.js";
 import { store } from "../store.js";
 import type {
   NetworkEvent,
   NetworkSnapshot,
   Operator,
   Order,
+  OrderDetail,
   OrderState,
+  Quote,
   SigningRound,
   TreasuryState,
   VaultAccount,
@@ -299,8 +301,58 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
     orders,
     rounds: coordinatorData?.rounds ?? prev?.rounds ?? [],
     events: coordinatorData?.events ?? prev?.events ?? [],
+    vaultToken: contracts?.cfg
+      ? {
+          assetId: `vault:${contracts.cfg.token}`,
+          symbol: contracts.cfg.token_symbol,
+          blockchain: "near",
+          decimals: contracts.cfg.token_decimals,
+          // The vault token is a USD stablecoin (test USDC on testnet).
+          price: 1,
+          contractAddress: contracts.cfg.token,
+        }
+      : (prev?.vaultToken ?? null),
     updatedAt: new Date().toISOString(),
   };
+}
+
+interface CoordinatorQuote {
+  amountIn: string;
+  amountOut: string;
+  zecUsd: number;
+  rate: number;
+  spreadBps: number;
+  confirmations: number;
+}
+
+/** ZEC SSL's own quote, from the coordinator, for settlement through the vault. */
+export async function coordinatorQuote(amountZec: string): Promise<Quote> {
+  const { data: q } = await fetchJson<CoordinatorQuote>(`${config.coordinatorUrl}/v1/quote?amountZec=${encodeURIComponent(amountZec)}`, { timeoutMs: 10_000 });
+  const token = store.state.network?.vaultToken;
+  if (!token) throw new HttpError(503, "vault token unknown; is NEAR_VAULT_CONTRACT set?");
+  const amountIn = Number(q.amountIn);
+  const amountInUsd = amountIn * q.zecUsd;
+  return {
+    source: "coordinator",
+    amountIn: q.amountIn,
+    amountInUsd,
+    amountOut: q.amountOut,
+    amountOutUsd: Number(q.amountOut),
+    minAmountOut: q.amountOut,
+    destination: token,
+    rate: q.rate,
+    spreadBps: q.spreadBps,
+    operatorFee: String(amountIn * (q.spreadBps / 10_000)),
+    // Direction 1 deposits pay the user's own wallet fee; the treasury pays none.
+    zcashNetworkFeeZec: "0",
+    timeEstimateSec: null,
+    quotedAt: new Date().toISOString(),
+  };
+}
+
+export async function orderDetail(id: string): Promise<OrderDetail> {
+  const { data } = await fetchJson<OrderDetail>(`${config.coordinatorUrl}/v1/orders/${encodeURIComponent(id)}`, { timeoutMs: 10_000 });
+  return data;
 }
 
 /** Forwards an order request to the coordinator, which owns quoting and deposit addresses. */

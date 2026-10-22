@@ -1,0 +1,28 @@
+[package]
+name = "ssl-wallet"
+version = "0.1.0"
+description = "View-only ZEC SSL treasury wallet: lightwalletd sync, per-order addresses, deposit lookup"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+hex.workspace = true
+rand.workspace = true
+# Must match zcash_client_sqlite's rusqlite: both link the native SQLite library.
+rusqlite = "0.37"
+# tonic and reqwest bring in different rustls crypto backends; we pick one explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["sync"] }
+tonic = { version = "0.14", features = ["tls-webpki-roots"] }
+tracing = "0.1"
+zcash_client_backend = { version = "=0.25.0-pre.2", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "sync"] }
+zcash_client_sqlite = { version = "=0.23.0-pre.2", features = ["orchard"] }
+zcash_keys = { version = "=0.17.0-pre.2", features = ["orchard"] }
+zcash_protocol.workspace = true
+zip32 = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

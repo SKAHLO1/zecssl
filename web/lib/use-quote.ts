@@ -19,9 +19,14 @@ const preferred: [symbol: string, chain: string][] = [
   ["SOL", "sol"],
 ];
 
+/**
+ * Where a swap can pay out. With a ZEC SSL vault configured, that is the vault's own token
+ * (settled by the operator network); otherwise the NEAR Intents list, for reference quotes.
+ */
 export function useDestinations(): IntentsToken[] {
-  const { intents } = useLive();
+  const { intents, network } = useLive();
   return useMemo(() => {
+    if (network.vaultToken) return [network.vaultToken];
     const tokens = (intents?.tokens ?? []).filter((t) => t.blockchain !== "zec" && t.price > 0);
     const picked: IntentsToken[] = [];
     for (const [sym, chain] of preferred) {
@@ -30,7 +35,7 @@ export function useDestinations(): IntentsToken[] {
     }
     const rest = tokens.filter((t) => !picked.includes(t)).sort((a, b) => a.symbol.localeCompare(b.symbol));
     return [...picked, ...rest];
-  }, [intents]);
+  }, [intents, network.vaultToken]);
 }
 
 /** Debounced, auto-refreshing quote for shielded ZEC -> destination. */

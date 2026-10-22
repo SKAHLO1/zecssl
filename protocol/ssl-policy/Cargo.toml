@@ -1,0 +1,11 @@
+[package]
+name = "ssl-policy"
+version = "0.1.0"
+description = "Order types shared by the ZEC SSL coordinator and operators, and the checks operators run before approving"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

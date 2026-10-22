@@ -3,7 +3,7 @@ import { config } from "./config.js";
 import { errorMessage, HttpError } from "./http.js";
 import { fetchChart } from "./sources/coingecko.js";
 import { quote } from "./sources/intents.js";
-import { createOrder } from "./sources/network.js";
+import { coordinatorQuote, createOrder, orderDetail } from "./sources/network.js";
 import { store } from "./store.js";
 import type { ChartRange, NetworkSnapshot, Overview, QuoteRequest, StreamTopic } from "./types.js";
 
@@ -20,6 +20,7 @@ function emptyNetwork(): NetworkSnapshot {
     orders: [],
     rounds: [],
     events: [],
+    vaultToken: null,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -67,7 +68,16 @@ export async function routes(app: FastifyInstance) {
     if (typeof body.amount !== "string" || typeof body.destinationAssetId !== "string") {
       throw new HttpError(400, "amount and destinationAssetId are required");
     }
+    if (body.destinationAssetId.startsWith("vault:")) {
+      if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected.");
+      return coordinatorQuote(body.amount);
+    }
     return quote(body, store.state.intents);
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/orders/:id", async (req) => {
+    if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected.");
+    return orderDetail(req.params.id);
   });
 
   app.post("/v1/orders", async (req) => {

@@ -3,14 +3,14 @@
 import { ArrowDownUp, ArrowLeft, ArrowRight, Check, CircleAlert, Copy, LoaderCircle } from "lucide-react";
 import Image from "next/image";
 import { useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { OrderBadge } from "@/components/network";
 import { TokenBadge, TokenSelect } from "@/components/token-select";
 import { buttonClass, Card, cx, Mono, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
 import { chainName, duration, token, usd } from "@/lib/format";
 import { useLive } from "@/lib/live";
-import type { IntentsToken } from "@/lib/types";
+import type { IntentsToken, OrderDetail, Quote } from "@/lib/types";
 import { useDestinations, useQuote } from "@/lib/use-quote";
 
 const steps = ["Details", "Review", "Deposit", "Settled"] as const;
@@ -20,7 +20,29 @@ interface OpenedOrder {
   depositAddress: string;
   memo?: string;
   expiresAt?: string;
+  amountZec?: string;
+  amountOut?: string;
+  symbol?: string;
+  /** ZIP 321 payment URI: address, amount and memo for wallets that support it. */
+  zip321?: string;
 }
+
+const pricingLabel: Record<Quote["source"], string> = {
+  coordinator: "ZEC SSL quote, settled by the vault",
+  router: "NEAR Intents router quote",
+  oracle: "NEAR Intents oracle price",
+};
+
+const progress: Record<string, string> = {
+  awaiting_deposit: "Waiting for your deposit",
+  deposit_detected: "Deposit seen, waiting for it to be mined",
+  confirming: "Deposit confirming",
+  signing: "Deposit confirmed. Operators are approving the release",
+  released: "Settled",
+  refunded: "Refunded",
+  expired: "Expired",
+  disputed: "Disputed",
+};
 
 function Stepper({ step }: { step: number }) {
   return (
@@ -101,7 +123,23 @@ function SwapFlow() {
   const refundError = validRefund(refund.trim());
   const canReview = Boolean(quote) && !recipientError && !refundError;
 
-  const live = useMemo(() => (order ? network.orders.find((o) => o.id === order.id) : undefined), [network.orders, order]);
+  // Once the order is open, follow it on the coordinator, which sees deposits as they land.
+  const [live, setLive] = useState<OrderDetail | null>(null);
+  useEffect(() => {
+    if (!order) return;
+    let cancelled = false;
+    const poll = () =>
+      api
+        .order(order.id)
+        .then((o) => !cancelled && setLive(o))
+        .catch(() => undefined);
+    poll();
+    const t = setInterval(poll, 8_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [order]);
   useEffect(() => {
     if (live?.state === "released") setStep(3);
   }, [live?.state]);
@@ -221,7 +259,7 @@ function SwapFlow() {
                   <Row label="Rate">{quote ? `1 ZEC ≈ ${token(quote.rate, 4)} ${quote.destination.symbol}` : "—"}</Row>
                   <Row label="Operator fee">{quote ? `${token(quote.operatorFee, 6)} ZEC (${quote.spreadBps / 100}%)` : "—"}</Row>
                   <Row label="Zcash network fee">{quote ? `${quote.zcashNetworkFeeZec} ZEC` : "—"}</Row>
-                  <Row label="Pricing">{quote ? (quote.source === "router" ? "NEAR Intents router quote" : "NEAR Intents oracle price") : "—"}</Row>
+                  <Row label="Pricing">{quote ? pricingLabel[quote.source] : "—"}</Row>
                 </div>
               </div>
               <button
@@ -293,33 +331,84 @@ function SwapFlow() {
               {live && <OrderBadge state={live.state} />}
             </div>
             {step === 2 && (
-              <div className="mt-5 rounded-2xl border border-line p-5">
-                <div className="text-sm font-semibold">Send {token(quote?.amountIn)} ZEC from a shielded address to</div>
-                <div className="mt-3 flex items-start gap-2 rounded-xl bg-sunken/70 p-3">
-                  <Mono className="break-all">{order.depositAddress}</Mono>
-                  <button
-                    className="shrink-0 rounded-lg p-1.5 hover:bg-surface"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(order.depositAddress);
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 1500);
-                    }}
-                    aria-label="Copy deposit address"
-                  >
-                    {copied ? <Check className="size-4 text-up" /> : <Copy className="size-4" />}
-                  </button>
-                </div>
-                {order.memo && (
-                  <p className="mt-3 text-sm text-ink-2">
-                    Include this memo: <Mono>{order.memo}</Mono>
+              <div className="mt-5 space-y-4">
+                <div className="rounded-2xl border border-line p-5">
+                  <div className="text-sm font-semibold">
+                    Send exactly {order.amountZec ?? token(quote?.amountIn)} ZEC from a shielded wallet to
+                  </div>
+                  <div className="mt-3 flex items-start gap-2 rounded-xl bg-sunken/70 p-3">
+                    <Mono className="break-all">{order.depositAddress}</Mono>
+                    <button
+                      className="shrink-0 rounded-lg p-1.5 hover:bg-surface"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(order.depositAddress);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 1500);
+                      }}
+                      aria-label="Copy deposit address"
+                    >
+                      {copied ? <Check className="size-4 text-up" /> : <Copy className="size-4" />}
+                    </button>
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-ink-2">
+                    {order.memo && (
+                      <span>
+                        Memo <Mono>{order.memo}</Mono>
+                      </span>
+                    )}
+                    {order.expiresAt && <span>Deposit by {new Date(order.expiresAt).toLocaleTimeString()}</span>}
+                    {order.zip321 && (
+                      <a href={order.zip321} className="font-medium text-forest hover:underline">
+                        Open in wallet
+                      </a>
+                    )}
+                  </div>
+                  <p className="mt-3 text-xs text-ink-3">
+                    The address is unique to this order. Send from a shielded (u…) address only; this deposit never touches a transparent address.
                   </p>
-                )}
-                <p className="mt-3 text-xs text-ink-3">This page updates as operators detect the deposit and sign the release.</p>
+                </div>
+                <div className="rounded-2xl bg-sunken/60 p-5">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    {live && !["released", "refunded", "expired"].includes(live.state) && <LoaderCircle className="size-4 animate-spin text-forest" />}
+                    {live ? (progress[live.state] ?? live.state) : "Checking order…"}
+                  </div>
+                  {live && (
+                    <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-3">
+                      <div>
+                        <dt className="text-xs text-ink-3">Received</dt>
+                        <dd className="tnum font-medium">
+                          {token(live.receivedZec)} / {live.amountInZec} ZEC
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs text-ink-3">Release approvals</dt>
+                        <dd className="tnum font-medium">
+                          {live.state === "signing" || live.state === "released" ? `${live.signatures} / ${live.threshold}` : "—"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-xs text-ink-3">You receive</dt>
+                        <dd className="tnum font-medium">
+                          {live.amountOut} {live.destinationSymbol}
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
+                  {live?.depositTxids.length ? (
+                    <div className="mt-3 text-xs text-ink-3">
+                      Deposit {live.depositTxids.map((t) => <Mono key={t}>{`${t.slice(0, 10)}…`}</Mono>)}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             )}
-            {step === 3 && (
-              <div className="mt-5 rounded-2xl border border-up/30 bg-up-50 p-5 text-sm text-up">
-                Settled. {live?.nearTxHash ? <Mono>{live.nearTxHash}</Mono> : null}
+            {step === 3 && live && (
+              <div className="mt-5 rounded-2xl border border-up/30 bg-up-50 p-5 text-sm">
+                <div className="font-semibold text-up">Settled</div>
+                <p className="mt-1 text-ink-2">
+                  {live.amountOut} {live.destinationSymbol} was paid to <Mono>{live.recipient}</Mono> after {live.threshold} operators each confirmed your deposit on
+                  Zcash.
+                </p>
               </div>
             )}
           </div>

@@ -133,7 +133,8 @@ export interface QuoteRequest {
 }
 
 export interface Quote {
-  source: "router" | "oracle";
+  /** coordinator: ZEC SSL's own quote, settled by the NEAR vault */
+  source: "coordinator" | "router" | "oracle";
   amountIn: string;
   amountInUsd: number;
   amountOut: string;
@@ -257,7 +258,18 @@ export interface NetworkSnapshot {
   orders: Order[];
   rounds: SigningRound[];
   events: NetworkEvent[];
+  /** The token the vault settles in, when a vault is configured. */
+  vaultToken: IntentsToken | null;
   updatedAt: string;
+}
+
+/** An order as the coordinator reports it, with what only it sees. */
+export interface OrderDetail extends Order {
+  depositAddress: string | null;
+  expiresAt: string;
+  receivedZec: string;
+  depositTxids: string[];
+  recipient: string;
 }
 
 export interface Overview {
