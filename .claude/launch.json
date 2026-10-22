@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "zec-ssl-api",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "C:/Users/USER/Downloads/zec-ssl/server", "dev"],
+      "port": 4000
+    },
+    {
+      "name": "zec-ssl-web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "C:/Users/USER/Downloads/zec-ssl/web", "dev"],
+      "port": 3000
+    }
+  ]
+}

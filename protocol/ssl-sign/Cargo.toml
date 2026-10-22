@@ -1,0 +1,22 @@
+[package]
+name = "ssl-sign"
+version = "0.1.0"
+description = "Prepares Ironwood/Orchard spends in a PCZT for external FROST signing, and applies the signatures"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ff.workspace = true
+clap.workspace = true
+hex.workspace = true
+orchard.workspace = true
+pasta_curves.workspace = true
+pczt.workspace = true
+rand.workspace = true
+reddsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zcash_primitives.workspace = true
+zcash_protocol.workspace = true

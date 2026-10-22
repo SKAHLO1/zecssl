@@ -1,0 +1,15 @@
+{
+  "name": "zec-ssl",
+  "private": true,
+  "license": "MIT",
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:server": "pnpm --filter @zec-ssl/server dev",
+    "dev:web": "pnpm --filter @zec-ssl/web dev",
+    "build": "pnpm --filter @zec-ssl/server build && pnpm --filter @zec-ssl/web build",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

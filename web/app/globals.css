@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+/*
+ * Palette from the product mock: deep forest green for brand and navigation,
+ * a warm paper background, and Zcash gold as the single accent.
+ * Up/down follow the market convention (green/red) and are used for price moves only.
+ */
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jbmono), ui-monospace, SFMono-Regular, monospace;
+
+  --color-paper: #f7f5ef;
+  --color-surface: #ffffff;
+  --color-sunken: #f1eee6;
+  --color-line: #e7e2d7;
+  --color-line-strong: #d6cfc0;
+
+  --color-ink: #13211b;
+  --color-ink-2: #4a5852;
+  --color-ink-3: #7b857f;
+
+  --color-forest: #12392d;
+  --color-forest-700: #0e2d23;
+  --color-forest-900: #0b1f18;
+  --color-forest-50: #e8efe9;
+  --color-forest-100: #d3e2d7;
+
+  --color-gold: #c4862a;
+  --color-gold-600: #a96f1c;
+  --color-gold-50: #f8eedd;
+
+  --color-up: #0e8a5c;
+  --color-up-50: #e3f4ec;
+  --color-down: #cf3f36;
+  --color-down-50: #fbe9e7;
+  --color-warn: #b7791f;
+  --color-warn-50: #fcf2df;
+
+  --radius-card: 14px;
+  --shadow-card: 0 1px 2px rgb(19 33 27 / 0.04), 0 1px 1px rgb(19 33 27 / 0.03);
+  --shadow-float: 0 12px 32px -12px rgb(11 31 24 / 0.28), 0 2px 6px rgb(11 31 24 / 0.08);
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-feature-settings: "cv11", "ss01";
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.card {
+  /* grid and flex children default to min-width:auto, which lets wide tables push the page sideways */
+  min-width: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.live-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes flash-up {
+  from { background-color: var(--color-up-50); }
+  to { background-color: transparent; }
+}
+
+@keyframes flash-down {
+  from { background-color: var(--color-down-50); }
+  to { background-color: transparent; }
+}
+
+.flash-up { animation: flash-up 1.2s ease-out; }
+.flash-down { animation: flash-down 1.2s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot, .flash-up, .flash-down { animation: none; }
+}
+
+/* thin, quiet scrollbars for horizontally scrolling tables */
+.scroll-x {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
