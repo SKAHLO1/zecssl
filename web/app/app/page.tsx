@@ -3,7 +3,7 @@
 import { Blocks, ChartLine, Network, Route } from "lucide-react";
 import Link from "next/link";
 import { RecentBlocks, SourcesList, TxMix } from "@/components/chain";
-import { EventsList, OrdersTable } from "@/components/network";
+import { EventsList, operatorSummary, OrdersTable } from "@/components/network";
 import { PriceChart } from "@/components/price-chart";
 import { QuickSwap } from "@/components/quick-swap";
 import { Card, Change, Sparkline, Stat } from "@/components/ui";
@@ -13,7 +13,7 @@ import { useLive } from "@/lib/live";
 export default function DashboardPage() {
   const { market, zcash, near, intents, network } = useLive();
   const zec = market.find((a) => a.id === "zcash");
-  const online = network.operators.filter((o) => o.state !== "offline").length;
+  const health = operatorSummary(network.operators);
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6">
@@ -33,8 +33,8 @@ export default function DashboardPage() {
         <Stat
           icon={<Network className="size-5" />}
           label="Operators online"
-          value={network.operators.length ? `${online} / ${network.operators.length}` : "—"}
-          sub={`${network.threshold.t}-of-${network.threshold.n} threshold${network.operators.length ? "" : " · not connected"}`}
+          value={health.value}
+          sub={`${network.threshold.t}-of-${network.threshold.n} threshold${health.note ? ` · ${health.note}` : ""}`}
         />
       </div>
 

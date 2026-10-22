@@ -40,6 +40,19 @@ const orderLabel: Record<OrderState, string> = {
   reimbursed: "Reimbursed",
 };
 
+/**
+ * "Online" only counts operators whose health endpoint answered. Operators known from the
+ * contract without an endpoint are unmonitored: their liveness is unknown, not good.
+ */
+export function operatorSummary(operators: { state: string }[]): { value: string; note: string | null } {
+  const monitored = operators.filter((o) => o.state !== "unmonitored");
+  const online = monitored.filter((o) => o.state === "online" || o.state === "degraded").length;
+  if (!operators.length) return { value: "—", note: "No operators configured" };
+  if (!monitored.length) return { value: "—", note: `${operators.length} bonded · health not monitored` };
+  const unmonitored = operators.length - monitored.length;
+  return { value: `${online} / ${monitored.length}`, note: unmonitored ? `${unmonitored} not monitored` : null };
+}
+
 export function OrderBadge({ state }: { state: OrderState }) {
   return (
     <Badge tone={orderTone[state]} dot>

@@ -1,7 +1,7 @@
 "use client";
 
 import { KeyRound, Landmark, Server, ShieldCheck } from "lucide-react";
-import { CoordinatorEmpty, EventsList, OperatorsTable, SigMeter } from "@/components/network";
+import { CoordinatorEmpty, EventsList, OperatorsTable, operatorSummary, SigMeter } from "@/components/network";
 import { Badge, Card, Mono, Stat } from "@/components/ui";
 import { ago, usd } from "@/lib/format";
 import { useLive, useNow } from "@/lib/live";
@@ -62,7 +62,7 @@ function FlowDiagram({ t, n }: { t: number; n: number }) {
 export default function OperatorsPage() {
   const { network } = useLive();
   const now = useNow();
-  const online = network.operators.filter((o) => o.state !== "offline").length;
+  const health = operatorSummary(network.operators);
   const bonded = network.treasury?.totalBondedUsd ?? (network.operators.some((o) => o.bondUsd != null) ? network.operators.reduce((s, o) => s + (o.bondUsd ?? 0), 0) : null);
   const { t, n } = network.threshold;
 
@@ -76,7 +76,7 @@ export default function OperatorsPage() {
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat icon={<Server className="size-5" />} label="Operators online" value={network.operators.length ? `${online} / ${network.operators.length}` : "—"} sub={network.operators.length ? undefined : "No endpoints configured"} />
+        <Stat icon={<Server className="size-5" />} label="Operators online" value={health.value} sub={health.note ?? undefined} />
         <Stat icon={<KeyRound className="size-5" />} label="Signing threshold" value={`${t} of ${n}`} sub={`Settles with up to ${n - t} offline`} />
         <Stat icon={<Landmark className="size-5" />} label="Total bonded" value={usd(bonded)} sub={network.bonds ? network.bonds.contract : "Bond contract not configured"} />
         <Stat
