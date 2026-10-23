@@ -43,6 +43,20 @@ protocol/
 
 The coordinator authenticates to operators with a shared bearer token. That's not what keeps them safe, though: operators re-check every proposal against their own rules.
 
+## Direction 2: USDC on NEAR → shielded ZEC
+
+1. **Quote:** the website calls `POST /v1/payouts` with the amount, the user's NEAR account and their shielded address. The coordinator prices it from its own feed (after spread), checks the treasury holds enough ZEC, and returns an order id plus the exact `ft_transfer_call` that locks the tokens.
+2. **Lock:** the user signs that transfer in their own NEAR wallet (Wallet Selector on `/app/swap/to-zec`). The vault's `lock_for_zec` holds the tokens in escrow under the order's terms: the address, the ZEC amount and a deadline.
+3. **Pay:** once the vault shows the order `locked`, the coordinator builds and proves the payout, then runs a FROST round of kind `payout`. Before committing, each operator checks with its own data:
+   - the vault order is direction 2, `locked`, and before its deadline;
+   - the tokens locked buy at least the ZEC asked for at its *own* price (`check_payout_terms`);
+   - the transaction pays the order's address *exactly* that amount, everything else goes back to the treasury, and the fee is within the allowance (`check_payout`);
+   - it hasn't signed a different payout for the order that could still be mined.
+4. **Claim:** each signer calls `claim_settlement` with the txid once its own wallet sees the payout at the required depth. At threshold, the vault opens the challenge window (6 hours on the testnet vault).
+5. **Settle:** after the window, a signer calls `finalize_settlement`, and the escrow becomes vault liquidity.
+
+If nobody pays before the deadline plus the release window, the user calls `reclaim` and gets the tokens back. If operators claim without paying, the user challenges with a bond and the arbiters decide.
+
 ### Run locally against testnet
 
 ```bash
@@ -63,7 +77,6 @@ The website's swap then quotes from the coordinator, pays out in the vault's tok
 
 ### Not in this phase
 
-- **Direction 2** (USDC → shielded ZEC) is Phase 7.
 - **Independence:** all services share one machine and one lightwalletd here. Production operators run on separate hosts with their own Zebra and Zaino (Phase 8).
 
 ## Build (Linux or WSL)
