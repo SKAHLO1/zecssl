@@ -13,14 +13,23 @@ import { token } from "@/lib/format";
 import { useLive, useNow } from "@/lib/live";
 import type { NetworkEvent, OrderDetail } from "@/lib/types";
 
-const FINAL = ["released", "refunded", "expired", "compensated"];
+const FINAL = ["released", "refunded", "expired", "compensated", "settled", "reimbursed"];
 
 /** The milestones of a shielded-ZEC-in order, and the event title that marks each. */
-const milestones: { label: string; match: RegExp }[] = [
+const zecInMilestones: { label: string; match: RegExp }[] = [
   { label: "Order opened on the vault", match: / opened$/ },
   { label: "Deposit seen on Zcash", match: /^Deposit (seen|confirming)/ },
   { label: "Deposit confirmed by operators", match: /^Deposit confirmed/ },
   { label: "Released on NEAR", match: / settled$/ },
+];
+
+/** Direction 2: vault tokens in, shielded ZEC out. */
+const zecOutMilestones: { label: string; match: RegExp }[] = [
+  { label: "Quoted", match: /^Quote .* issued$/ },
+  { label: "Tokens locked in the vault", match: / locked for / },
+  { label: "Shielded ZEC sent", match: /^ZEC sent for / },
+  { label: "Payment claimed by operators", match: /^Payout for .* claimed/ },
+  { label: "Settled after the challenge window", match: / settled$/ },
 ];
 
 function base64url(s: string): string {
@@ -44,14 +53,14 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   );
 }
 
-function Timeline({ events, state }: { events: NetworkEvent[]; state: string }) {
+function Timeline({ events, state, zecOut }: { events: NetworkEvent[]; state: string; zecOut: boolean }) {
   const at = (re: RegExp) => events.find((e) => re.test(e.title))?.at ?? null;
-  const reached = milestones.map((m) => ({ ...m, at: at(m.match) }));
-  const failed = state === "refunding" || state === "refunded" || state === "expired" || state === "disputed";
+  const reached = (zecOut ? zecOutMilestones : zecInMilestones).map((m) => ({ ...m, at: at(m.match) }));
+  const failed = ["refunding", "refunded", "expired", "disputed", "reimbursed"].includes(state);
   return (
     <ol className="relative space-y-5 border-l border-line pl-6">
       {reached.map((m, i) => {
-        const done = Boolean(m.at) || (state === "released" && i < reached.length);
+        const done = Boolean(m.at) || ((state === "released" || state === "settled") && i < reached.length);
         const current = !done && (i === 0 || Boolean(reached[i - 1].at));
         return (
           <li key={m.label} className="relative">
@@ -151,7 +160,8 @@ export default function OrderPage() {
     return <div className="mx-auto grid h-64 max-w-3xl place-items-center text-sm text-ink-3">Loading order…</div>;
   }
 
-  const awaiting = ["quoted", "awaiting_deposit", "deposit_detected", "confirming"].includes(order.state);
+  const zecOut = order.direction === "near_to_zec";
+  const awaiting = !zecOut && ["quoted", "awaiting_deposit", "deposit_detected", "confirming"].includes(order.state);
   const uri = order.depositAddress ? `zcash:${order.depositAddress}?amount=${order.amountInZec}&memo=${base64url(order.id)}` : null;
   const secondsLeft = Math.max(0, Math.round((Date.parse(order.expiresAt) - now) / 1000));
   const shareUrl = typeof window !== "undefined" ? window.location.href : "";
@@ -169,7 +179,9 @@ export default function OrderPage() {
             <OrderBadge state={order.state} />
           </div>
           <p className="tnum mt-1 text-sm text-ink-2">
-            {order.amountInZec} shielded ZEC → {order.amountOut} {order.destinationSymbol} on NEAR {net}
+            {zecOut
+              ? `${order.amountOut} ${order.destinationSymbol} on NEAR ${net} → ${order.amountInZec} shielded ZEC`
+              : `${order.amountInZec} shielded ZEC → ${order.amountOut} ${order.destinationSymbol} on NEAR ${net}`}
           </p>
         </div>
         <div className="flex items-center gap-2 rounded-xl bg-sunken/70 px-3 py-2 text-xs text-ink-2">
@@ -180,6 +192,38 @@ export default function OrderPage() {
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="space-y-6">
+          {zecOut && (
+            <Card title="Shielded payout">
+              <dl className="grid gap-4 text-sm sm:grid-cols-3">
+                <div>
+                  <dt className="text-xs text-ink-3">Locked</dt>
+                  <dd className="tnum font-medium">
+                    {order.amountOut} {order.destinationSymbol}
+                  </dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-xs text-ink-3">Pays</dt>
+                  <dd className="tnum font-medium">{order.amountInZec} ZEC</dd>
+                </div>
+                <div className="sm:col-span-3">
+                  <dt className="text-xs text-ink-3">To shielded address</dt>
+                  <dd>
+                    <Mono className="break-all">{order.payoutAddress ?? "—"}</Mono>
+                  </dd>
+                </div>
+              </dl>
+              {order.payoutTxid && (
+                <div className="mt-4 border-t border-line pt-3 text-sm">
+                  <div className="text-xs text-ink-3">Payout transaction (shielded)</div>
+                  <a href={explorer.zcashTx(net, order.payoutTxid)} target="_blank" rel="noreferrer" className="mt-1 flex items-center gap-1.5 text-forest hover:underline">
+                    <Mono>{`${order.payoutTxid.slice(0, 16)}…${order.payoutTxid.slice(-8)}`}</Mono>
+                    <ExternalLink className="size-3" />
+                  </a>
+                </div>
+              )}
+            </Card>
+          )}
+          {!zecOut && (
           <Card title="Deposit">
             {awaiting && order.depositAddress && uri ? (
               <div className="flex flex-col gap-5 sm:flex-row">
@@ -246,6 +290,7 @@ export default function OrderPage() {
               </div>
             )}
           </Card>
+          )}
 
           <Card title="Event log">
             {order.events.length === 0 ? (
@@ -269,13 +314,17 @@ export default function OrderPage() {
 
         <div className="space-y-6">
           <Card title="Progress">
-            <Timeline events={order.events} state={order.state} />
+            <Timeline events={order.events} state={order.state} zecOut={zecOut} />
           </Card>
           <Card title="On-chain approvals">
             {order.vault ? (
               <div className="space-y-5">
-                <Approvals title="Opened by" accounts={order.vault.approvers} threshold={order.threshold} net={net} />
-                {order.vault.refundApprovals.length > 0 || order.state === "refunding" || order.state === "refunded" ? (
+                {zecOut ? (
+                  <Approvals title="Payment claimed by" accounts={order.vault.approvers} threshold={order.threshold} net={net} />
+                ) : (
+                  <Approvals title="Opened by" accounts={order.vault.approvers} threshold={order.threshold} net={net} />
+                )}
+                {zecOut ? null : order.vault.refundApprovals.length > 0 || order.state === "refunding" || order.state === "refunded" ? (
                   <Approvals title="Refund confirmed by" accounts={order.vault.refundApprovals} threshold={order.threshold} net={net} />
                 ) : (
                   <Approvals title="Released by" accounts={order.vault.releaseApprovals} threshold={order.threshold} net={net} />
@@ -288,10 +337,10 @@ export default function OrderPage() {
               <p className="text-sm text-ink-3">Vault contract not configured.</p>
             )}
           </Card>
-          <Card title="Payout">
+          <Card title={zecOut ? "NEAR account" : "Payout"}>
             <dl className="space-y-2 text-sm">
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-3">Recipient</dt>
+                <dt className="text-ink-3">{zecOut ? "Locked by" : "Recipient"}</dt>
                 <dd className="truncate">
                   <a href={explorer.nearAccount(net, order.recipient)} target="_blank" rel="noreferrer" className="hover:underline">
                     {order.recipient}
@@ -299,7 +348,7 @@ export default function OrderPage() {
                 </dd>
               </div>
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-3">Amount</dt>
+                <dt className="text-ink-3">{zecOut ? "Tokens locked" : "Amount"}</dt>
                 <dd className="tnum font-medium">
                   {order.amountOut} {order.destinationSymbol}
                 </dd>
