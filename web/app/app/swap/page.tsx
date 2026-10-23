@@ -258,9 +258,14 @@ function SwapFlow() {
               </div>
 
               <div className="flex items-center justify-center">
-                <span className="grid size-10 place-items-center rounded-full border border-line bg-surface text-ink-3" title="Only shielded ZEC out is live in the MVP">
+                <Link
+                  href="/app/swap/to-zec"
+                  className="grid size-10 place-items-center rounded-full border border-line bg-surface text-ink-3 transition hover:bg-sunken hover:text-ink"
+                  title="Switch direction: USDC to shielded ZEC"
+                  aria-label="Switch direction: USDC to shielded ZEC"
+                >
                   <ArrowDownUp className="size-4 md:rotate-90" />
-                </span>
+                </Link>
               </div>
 
               <div className="rounded-2xl border border-line p-4">
