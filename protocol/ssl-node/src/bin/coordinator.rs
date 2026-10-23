@@ -9,6 +9,11 @@
 //! refund, then runs a two-round rerandomized FROST signing round with a threshold of
 //! operators, each of which checks the transaction for itself before signing.
 //!
+//! Direction 2 (vault tokens → shielded ZEC): `POST /v1/payouts` quotes an order and returns
+//! the `ft_transfer_call` message that locks the tokens on the vault. Once the vault shows
+//! the order locked, the coordinator pays the ZEC through the same kind of FROST round, and
+//! the operators claim settlement on the vault.
+//!
 //! Configuration (environment):
 //!   COORDINATOR_LISTEN       127.0.0.1:7000 (or 0.0.0.0:$PORT when PORT is set)
 //!   OPERATORS                name=url pairs, comma separated; or OPERATOR_1_URL /
@@ -51,6 +56,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use base64::Engine as _;
 use ssl_node::signing::{txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendPackage};
+use ssl_node::vault::VaultOrder;
 use ssl_node::vault::{Vault, VaultConfig};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, VERSION};
 use ssl_policy::{deposit_status, valid_near_account, DepositStatus, OrderTerms, Proposal, SeenDeposit};
@@ -154,6 +160,13 @@ fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
              ALTER TABLE orders ADD COLUMN refund_attempt_ns INTEGER;",
         )?;
     }
+    // v4: direction-2 orders share the table. For them `recipient` is the NEAR account that
+    // locks tokens, `address` the shielded payout address, `amount_out` the tokens locked
+    // (raw units), `zec_zat` the ZEC paid, and `refund_tx` the payout transaction.
+    let has_direction: bool = conn.prepare("SELECT 1 FROM pragma_table_info('orders') WHERE name = 'direction'")?.exists([])?;
+    if !has_direction {
+        conn.execute_batch("ALTER TABLE orders ADD COLUMN direction TEXT NOT NULL DEFAULT 'zec_to_near';")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS signing_rounds (
             id TEXT PRIMARY KEY,
@@ -187,6 +200,18 @@ fn parse_zec(s: &str) -> Result<u64> {
     whole.checked_mul(100_000_000).and_then(|w| w.checked_add(frac)).ok_or_else(|| anyhow!("amount too large"))
 }
 
+/// Parses a decimal token amount into raw units without floating point.
+fn parse_units(s: &str, decimals: u8) -> Result<u128> {
+    let s = s.trim();
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty() && frac.is_empty() || !whole.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) || frac.len() > decimals as usize {
+        bail!("amount must be a decimal with at most {decimals} decimals");
+    }
+    let whole: u128 = if whole.is_empty() { 0 } else { whole.parse()? };
+    let frac: u128 = if decimals == 0 { 0 } else { format!("{frac:0<width$}", width = decimals as usize).parse()? };
+    whole.checked_mul(10u128.pow(decimals as u32)).and_then(|w| w.checked_add(frac)).ok_or_else(|| anyhow!("amount too large"))
+}
+
 fn format_units(raw: u128, decimals: u8) -> String {
     let base = 10u128.pow(decimals as u32);
     let frac = raw % base;
@@ -207,6 +232,10 @@ fn public_state(state: &str) -> &str {
     match state {
         "awaiting_deposit" | "deposit_detected" | "confirming" | "signing" | "refunding" | "released" | "refunded" | "expired" | "disputed" | "compensated" => state,
         "needs_refund" => "refunding",
+        // Direction 2.
+        "awaiting_lock" => "quoted",
+        "locked" | "paying" | "paid" => "locked",
+        "claimed" | "challenged" | "settled" | "reimbursed" => if state == "challenged" { "disputed" } else { state },
         _ => "quoted",
     }
 }
@@ -370,21 +399,27 @@ impl Coordinator {
         if let Err(e) = synced {
             return tracing::warn!(error = %e, "sync failed");
         }
-        let open: Vec<(String, String, u64, u64, String)> = {
+        let open: Vec<(String, String, u64, u64, String, String)> = {
             let db = self.db.lock().await;
             let mut stmt = match db.prepare(
-                "SELECT id, address, zec_zat, deadline_ns, state FROM orders
-                 WHERE state IN ('awaiting_deposit', 'deposit_detected', 'confirming', 'signing', 'needs_refund', 'refunding')",
+                "SELECT id, address, zec_zat, deadline_ns, state, direction FROM orders
+                 WHERE state IN ('awaiting_deposit', 'deposit_detected', 'confirming', 'signing', 'needs_refund', 'refunding',
+                                 'awaiting_lock', 'locked', 'paying', 'paid', 'claimed', 'challenged')",
             ) {
                 Ok(s) => s,
                 Err(e) => return tracing::error!(error = %e, "listing orders"),
             };
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64, r.get(4)?)))
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64, r.get(4)?, r.get(5)?)))
                 .map(|rows| rows.filter_map(Result::ok).collect())
                 .unwrap_or_default()
         };
-        for (id, address, zec_zat, deadline, state) in open {
-            if let Err(e) = self.advance(&id, &address, zec_zat, deadline, &state).await {
+        for (id, address, zec_zat, deadline, state, direction) in open {
+            let advanced = if direction == "near_to_zec" {
+                self.advance_payout(&id, deadline, &state).await
+            } else {
+                self.advance(&id, &address, zec_zat, deadline, &state).await
+            };
+            if let Err(e) = advanced {
                 tracing::warn!(order = %id, error = %e, "advancing order");
             }
         }
@@ -524,7 +559,8 @@ impl Coordinator {
                 params![round_id, id, now_ns() as i64],
             );
         }
-        match self.refund(frost, id, &round_id, &refund_address, received_zat - self.refund_fee_zat).await {
+        let memo = format!("zec-ssl refund {id}");
+        match self.spend(frost, RoundKind::Refund, id, &round_id, &refund_address, received_zat - self.refund_fee_zat, &memo).await {
             Ok(txid) => {
                 tracing::info!(order = id, round = %round_id, %txid, "refund broadcast");
                 self.finish_round(&round_id, "complete", None).await;
@@ -545,6 +581,176 @@ impl Coordinator {
         }
     }
 
+    /// Direction 2: follows a locked order on the vault, pays it once, and tracks the
+    /// operators' claim through to settlement. The vault's terms are what get paid; the
+    /// operators check them against their own prices before signing.
+    async fn advance_payout(&self, id: &str, deadline: u64, state: &str) -> Result<()> {
+        let Some(order) = self.vault.order(id).await? else {
+            // Quoted but never locked.
+            if now_ns() > deadline && self.set_state(id, "expired").await? {
+                self.event(id, "order", &format!("Quote {id} expired"), "no tokens were locked before the deadline").await;
+            }
+            return Ok(());
+        };
+        anyhow::ensure!(order.direction == "near_to_zec", "{id} is not a direction-2 order on the vault");
+        {
+            let db = self.db.lock().await;
+            db.execute("UPDATE orders SET approvals = ?1 WHERE id = ?2", params![order.approvers.len() as i64, id])?;
+        }
+        let next = match order.state.as_str() {
+            "locked" => {
+                if state == "awaiting_lock" && self.set_state(id, "locked").await? {
+                    let amount = format_units(order.escrow.parse().unwrap_or(0), self.vault_config.token_decimals);
+                    self.event(id, "order", &format!("{amount} {} locked for {id}", self.vault_config.token_symbol), "the vault holds the tokens until the ZEC is paid").await;
+                }
+                return self.pay(id, &order).await;
+            }
+            "claimed" => "claimed",
+            "challenged" => "challenged",
+            "settled" => "settled",
+            "reimbursed" => "reimbursed",
+            _ => return Ok(()),
+        };
+        if self.set_state(id, next).await? {
+            let (kind, title) = match next {
+                "claimed" => ("release", format!("Payout for {id} claimed by operators")),
+                "settled" => ("release", format!("Order {id} settled")),
+                "reimbursed" => ("refund", format!("Order {id} reimbursed")),
+                _ => ("order", format!("Order {id} {next}")),
+            };
+            self.event(id, kind, &title, &format!("vault state: {}", order.state)).await;
+        }
+        Ok(())
+    }
+
+    /// Pays a locked order's ZEC unless a payout is already out and can still be mined.
+    async fn pay(&self, id: &str, order: &VaultOrder) -> Result<()> {
+        let Some(frost) = &self.frost else { return Ok(()) };
+        let (txid, expiry, last_attempt): (Option<String>, Option<u32>, Option<i64>) = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT refund_tx, refund_expiry, refund_attempt_ns FROM orders WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        };
+        if let Some(txid) = txid {
+            let (mined, tip) = {
+                let w = self.wallet.lock().await;
+                (w.tx_mined_height(&txid)?, w.heights()?.1.unwrap_or(0))
+            };
+            let expired = mined.is_none() && expiry.is_some_and(|e| e > 0 && tip > e);
+            if !expired {
+                return Ok(()); // out, or mined: the operators claim from here
+            }
+            self.event(id, "signing", &format!("Payout for {id} expired unmined"), &format!("{txid} was not mined by block {}; paying again", expiry.unwrap_or(0))).await;
+        }
+        if last_attempt.is_some_and(|t| now_ns().saturating_sub(t as u64) < REFUND_RETRY.as_nanos() as u64) {
+            return Ok(());
+        }
+        if now_ns() > order.terms.deposit_deadline {
+            return Ok(()); // too late to pay; the user can reclaim the tokens
+        }
+        let to = order.zec_address.clone().ok_or_else(|| anyhow!("order has no payout address"))?;
+        let round_id = format!("po-{id}-{:08x}", random_u64() as u32);
+        {
+            let db = self.db.lock().await;
+            db.execute("UPDATE orders SET refund_attempt_ns = ?1, state = 'paying' WHERE id = ?2", params![now_ns() as i64, id])?;
+            db.execute(
+                "INSERT INTO signing_rounds (id, order_id, kind, state, started_ns) VALUES (?1, ?2, 'payout', 'open', ?3)",
+                params![round_id, id, now_ns() as i64],
+            )?;
+        }
+        let value = order.terms.zec_amount_zat;
+        match self.spend(frost, RoundKind::Payout, id, &round_id, &to, value, &format!("zec-ssl {id}")).await {
+            Ok(txid) => {
+                tracing::info!(order = id, round = %round_id, %txid, "payout broadcast");
+                self.finish_round(&round_id, "complete", None).await;
+                self.set_state(id, "paid").await?;
+                self.event(id, "release", &format!("ZEC sent for {id}"), &format!("{} ZEC to the payout address in {txid}", format_units(value as u128, 8))).await;
+            }
+            Err(e) => {
+                tracing::warn!(order = id, round = %round_id, error = %e, "payout round failed");
+                self.finish_round(&round_id, "failed", Some(&e.to_string())).await;
+                self.set_state(id, "locked").await?;
+                self.event(id, "signing", &format!("Payout round for {id} failed"), &e.to_string()).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Quotes a direction-2 order: how much ZEC the tokens buy, and the message that locks
+    /// them on the vault. Nothing is locked until the user sends that transfer.
+    async fn quote_payout(&self, req: QuotePayout) -> Result<Value, (StatusCode, String)> {
+        let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+        let decimals = self.vault_config.token_decimals;
+        let amount_in = parse_units(&req.amount_in, decimals).map_err(|e| bad(&e.to_string()))?;
+        if amount_in == 0 || amount_in > self.max_amount_out {
+            return Err(bad("amount is outside the order limits"));
+        }
+        if !valid_near_account(&req.account) {
+            return Err(bad("account is not a valid NEAR account"));
+        }
+        let is_test = self.wallet.lock().await.is_testnet();
+        if !valid_refund_address(is_test, &req.zec_address) {
+            return Err(bad("payout address must be a shielded unified address"));
+        }
+        self.wallet.lock().await.orchard_receiver(&req.zec_address).map_err(|e| bad(&format!("payout address: {e}")))?;
+        let zec_usd = self.prices.zec_usd().await.ok_or((StatusCode::SERVICE_UNAVAILABLE, "no ZEC price available".into()))?;
+        let usd = amount_in as f64 / 10f64.powi(decimals as i32);
+        let zec_zat = (usd / (zec_usd / (1.0 - self.spread_bps as f64 / 10_000.0)) * 1e8).floor() as u64;
+        if zec_zat < self.min_zec_zat {
+            return Err(bad("amount is below the minimum"));
+        }
+        let treasury = self.wallet.lock().await.balance_zat().map_err(internal)?;
+        if zec_zat + self.refund_fee_zat > treasury {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "the treasury doesn't hold enough ZEC for this order right now".into()));
+        }
+
+        let now = now_ns();
+        let deadline = now + self.deposit_window_ns;
+        let seq: i64 = {
+            let db = self.db.lock().await;
+            db.execute(
+                "INSERT INTO orders (direction, recipient, refund_address, address, amount_out, zec_zat, deadline_ns, zec_usd, state, created_ns, updated_ns)
+                 VALUES ('near_to_zec', ?1, '', ?2, ?3, ?4, ?5, ?6, 'proposing', ?7, ?7)",
+                params![req.account, req.zec_address, amount_in.to_string(), zec_zat as i64, deadline as i64, zec_usd, now as i64],
+            )
+            .map_err(internal)?;
+            db.last_insert_rowid()
+        };
+        let id = format!("zp-{seq}-{:06x}", random_u64() & 0xff_ffff);
+        {
+            let db = self.db.lock().await;
+            db.execute("UPDATE orders SET id = ?1, state = 'awaiting_lock' WHERE seq = ?2", params![id, seq]).map_err(internal)?;
+        }
+        let msg = json!({
+            "action": "lock_for_zec",
+            "order_id": id,
+            "zec_address": req.zec_address,
+            "zec_amount_zat": zec_zat.to_string(),
+            "deadline": deadline.to_string(),
+        });
+        let zec = format_units(zec_zat as u128, 8);
+        let amount = format_units(amount_in, decimals);
+        self.event(&id, "order", &format!("Quote {id} issued"), &format!("{amount} {} → {zec} shielded ZEC", self.vault_config.token_symbol)).await;
+        Ok(json!({
+            "id": id,
+            "state": "quoted",
+            "amountIn": amount,
+            "amountInRaw": amount_in.to_string(),
+            "symbol": self.vault_config.token_symbol,
+            "zecAmount": zec,
+            "zecAmountZat": zec_zat.to_string(),
+            "zecAddress": req.zec_address,
+            "expiresAt": ns_to_rfc3339(deadline),
+            "token": self.vault_config.token,
+            "vault": self.vault.contract,
+            // The arguments of ft_transfer_call on `token`, with 1 yoctoNEAR attached.
+            "transfer": {
+                "receiver_id": self.vault.contract,
+                "amount": amount_in.to_string(),
+                "msg": msg.to_string(),
+            },
+        }))
+    }
+
     async fn finish_round(&self, round_id: &str, state: &str, error: Option<&str>) {
         let db = self.db.lock().await;
         if let Err(e) = db.execute(
@@ -555,10 +761,11 @@ impl Coordinator {
         }
     }
 
-    /// One refund signing round. Returns the broadcast txid.
-    async fn refund(&self, frost: &ssl_frost::Coordinator, id: &str, round_id: &str, to: &str, value_zat: u64) -> Result<String> {
+    /// One treasury signing round (a refund or a payout). Returns the broadcast txid.
+    #[allow(clippy::too_many_arguments)]
+    async fn spend(&self, frost: &ssl_frost::Coordinator, kind: RoundKind, id: &str, round_id: &str, to: &str, value_zat: u64, memo: &str) -> Result<String> {
         // Reuse the transaction of an earlier attempt while it can still be mined: an
-        // operator that already signed it will not sign a different one.
+        // operator that already signed it will not sign a different one for the order.
         let tip = self.wallet.lock().await.heights()?.1.unwrap_or(0);
         let earlier: Option<String> = {
             let db = self.db.lock().await;
@@ -572,13 +779,13 @@ impl Coordinator {
         let proved = match earlier {
             Some(b64) => base64::engine::general_purpose::STANDARD.decode(b64)?,
             None => {
-                let pczt = self.wallet.lock().await.create_payment(to, value_zat, &format!("zec-ssl refund {id}"))?;
+                let pczt = self.wallet.lock().await.create_payment(to, value_zat, memo)?;
                 // Proving takes seconds of CPU and needs no wallet.
                 tokio::task::spawn_blocking(move || ssl_wallet::prove(&pczt)).await??
             }
         };
         let request = ssl_sign::prepare(&proved)?;
-        anyhow::ensure!(request.effects.is_fully_shielded(), "refund is not fully shielded");
+        anyhow::ensure!(request.effects.is_fully_shielded(), "{} is not fully shielded", kind.as_str());
         let txid = txid_from_sighash(&request.sighash).ok_or_else(|| anyhow!("bad sighash"))?;
         let pczt_b64 = base64::engine::general_purpose::STANDARD.encode(&proved);
         {
@@ -591,7 +798,7 @@ impl Coordinator {
 
         // Round 1: every operator checks the transaction; the first threshold to commit sign.
         let threshold = self.vault_config.threshold as usize;
-        let body = serde_json::to_value(Round1Request { round_id: round_id.into(), kind: RoundKind::Refund, order_id: id.into(), pczt: pczt_b64 })?;
+        let body = serde_json::to_value(Round1Request { round_id: round_id.into(), kind, order_id: id.into(), pczt: pczt_b64 })?;
         let timeout = Duration::from_secs(90);
         let body = &body;
         let mut pending: FuturesUnordered<_> = self
@@ -659,7 +866,7 @@ impl Coordinator {
         }
         let signed = ssl_sign::apply(&proved, &signatures)?;
         let tx = ssl_sign::extract(&signed)?;
-        anyhow::ensure!(tx.transparent_inputs == 0 && tx.transparent_outputs == 0, "extracted refund has transparent parts");
+        anyhow::ensure!(tx.transparent_inputs == 0 && tx.transparent_outputs == 0, "extracted {} has transparent parts", kind.as_str());
         anyhow::ensure!(tx.txid == txid, "extracted txid {} differs from the signed sighash", tx.txid);
         let send = self.wallet.lock().await.broadcast(&tx.raw);
         send.await?;
@@ -675,7 +882,7 @@ impl Coordinator {
 
     async fn order_rows(&self, where_id: Option<&str>, limit: i64) -> Result<Vec<Value>> {
         let db = self.db.lock().await;
-        let sql = "SELECT id, state, zec_zat, amount_out, approvals, release_approvals, created_ns, updated_ns, address, deadline_ns, received_zat, deposit_txids, recipient, refund_tx
+        let sql = "SELECT id, state, zec_zat, amount_out, approvals, release_approvals, created_ns, updated_ns, address, deadline_ns, received_zat, deposit_txids, recipient, refund_tx, direction
                    FROM orders WHERE id IS NOT NULL AND state != 'proposing' AND (?1 IS NULL OR id = ?1) ORDER BY seq DESC LIMIT ?2";
         let mut stmt = db.prepare(sql)?;
         let decimals = self.vault_config.token_decimals;
@@ -683,7 +890,33 @@ impl Coordinator {
         let rows = stmt.query_map(params![where_id, limit], |r| {
             let state: String = r.get(1)?;
             let amount_out: String = r.get(3)?;
+            let direction: String = r.get(14)?;
             let signing = matches!(state.as_str(), "signing" | "released");
+            if direction == "near_to_zec" {
+                // amountOut is the tokens locked; amountInZec the ZEC paid out.
+                return Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "direction": "near_to_zec",
+                    "state": public_state(&state),
+                    "internalState": state,
+                    "amountInZec": format_units(r.get::<_, i64>(2)? as u128, 8),
+                    "amountOut": format_units(amount_out.parse().unwrap_or(0), decimals),
+                    "destinationSymbol": self.vault_config.token_symbol,
+                    "signatures": r.get::<_, i64>(4)?,
+                    "threshold": t,
+                    "createdAt": ns_to_rfc3339(r.get::<_, i64>(6)? as u64),
+                    "updatedAt": ns_to_rfc3339(r.get::<_, i64>(7)? as u64),
+                    "nearTxHash": Value::Null,
+                    "depositAddress": Value::Null,
+                    "payoutAddress": r.get::<_, Option<String>>(8)?,
+                    "expiresAt": ns_to_rfc3339(r.get::<_, i64>(9)? as u64),
+                    "receivedZec": "0",
+                    "depositTxids": [],
+                    "recipient": r.get::<_, String>(12)?,
+                    "refundTxid": Value::Null,
+                    "payoutTxid": r.get::<_, Option<String>>(13)?,
+                }));
+            }
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "direction": "zec_to_near",
@@ -703,6 +936,8 @@ impl Coordinator {
                 "depositTxids": r.get::<_, Option<String>>(11)?.map(|s| s.split(',').filter(|t| !t.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default(),
                 "recipient": r.get::<_, String>(12)?,
                 "refundTxid": r.get::<_, Option<String>>(13)?,
+                "payoutAddress": Value::Null,
+                "payoutTxid": Value::Null,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -741,6 +976,24 @@ struct CreateOrder {
 
 async fn create_order(State(c): State<App>, Json(req): Json<CreateOrder>) -> Response {
     match c.create_order(req).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_json(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotePayout {
+    /// Vault tokens to lock, as a decimal string (e.g. "12.5").
+    amount_in: String,
+    /// The NEAR account that will lock them.
+    account: String,
+    /// Shielded unified address the ZEC goes to.
+    zec_address: String,
+}
+
+async fn quote_payout(State(c): State<App>, Json(req): Json<QuotePayout>) -> Response {
+    match c.quote_payout(req).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_json(e),
     }
@@ -943,6 +1196,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/quote", get(quote))
         .route("/v1/orders", post(create_order).get(list_orders))
+        .route("/v1/payouts", post(quote_payout))
         .route("/v1/orders/{id}", get(get_order))
         .route("/v1/orders/{id}/events", get(order_events))
         .route("/v1/events", get(events))
@@ -974,6 +1228,14 @@ mod tests {
         assert_eq!(base64url(b"zs-1"), "enMtMQ");
         assert_eq!(base64url(b"zs-12"), "enMtMTI");
         assert_eq!(base64url(b"zs-123"), "enMtMTIz");
+    }
+
+    #[test]
+    fn parses_token_amounts_exactly() {
+        assert_eq!(parse_units("12.5", 6).unwrap(), 12_500_000);
+        assert_eq!(parse_units("0.000001", 6).unwrap(), 1);
+        assert!(parse_units("0.0000001", 6).is_err());
+        assert!(parse_units("1,5", 6).is_err());
     }
 
     #[test]
