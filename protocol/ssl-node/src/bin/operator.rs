@@ -8,6 +8,10 @@
 //! - signs refunds of underpaid or late deposits in a rerandomized FROST round, but only
 //!   after checking the transaction itself (see `ssl_policy::check_refund`), and approves
 //!   the refund on the vault once its own wallet sees it mined;
+//! - for direction 2 (vault tokens in, shielded ZEC out), signs the payout only after
+//!   checking the locked order against its own price and the transaction against the order,
+//!   claims settlement on the vault once its wallet sees the payout mined, and finalizes
+//!   the claim when the challenge window closes;
 //! - reports its health at `GET /health`.
 //!
 //! It never trusts the coordinator: a proposal is just a request to check.
@@ -53,9 +57,12 @@ use serde_json::{json, Value};
 use ssl_near::Signer;
 use base64::Engine as _;
 use ssl_frost::{Share, SigningNonces};
-use ssl_node::signing::{refund_tx, txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, SpendCommitment, SpendShare};
+use ssl_node::signing::{refund_tx, txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendCommitment, SpendShare};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, vault::Vault, VERSION};
-use ssl_policy::{check_against_vault, check_proposal, check_refund, deposit_status, DepositStatus, Limits, Proposal, SeenDeposit};
+use ssl_policy::{
+    check_against_vault, check_payout, check_payout_terms, check_proposal, check_refund, deposit_status, DepositStatus, Limits, Proposal, RefundRejection,
+    SeenDeposit,
+};
 use ssl_wallet::{derive_address, parse_network, TreasuryWallet};
 use tokio::sync::Mutex;
 
@@ -77,9 +84,12 @@ struct Node {
     /// order cannot both pass the one-refund check.
     signing: Mutex<()>,
     max_refund_fee_zat: u64,
+    /// The vault's challenge window for direction-2 claims (ns).
+    challenge_window_ns: u64,
 }
 
 struct OpenRound {
+    kind: RoundKind,
     order_id: String,
     sighash: Vec<u8>,
     expiry_height: u32,
@@ -124,6 +134,19 @@ fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
              ALTER TABLE orders ADD COLUMN refund_expiry INTEGER;
              ALTER TABLE orders ADD COLUMN refund_approval_tx TEXT;")?;
     }
+    // v3: direction-2 payouts this operator signed: the Zcash txid and its expiry, then its
+    // NEAR claim_settlement and (if it got there first) finalize_settlement.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS payouts (
+            order_id TEXT PRIMARY KEY,
+            txid TEXT NOT NULL,
+            expiry INTEGER NOT NULL,
+            claim_tx TEXT,
+            finalize_tx TEXT,
+            final_state TEXT,
+            created_ns INTEGER NOT NULL
+        );",
+    )?;
     Ok(conn)
 }
 
@@ -252,66 +275,111 @@ impl Node {
         Ok(Some(json!({ "order": id, "decision": "approved refund", "tx": outcome.tx_hash })))
     }
 
-    /// One refund per order. A different refund may be signed only once the earlier one can
-    /// no longer be mined (unmined and past its expiry height); otherwise both could land.
-    async fn may_sign_refund(&self, order_id: &str, txid: &str) -> Result<(), String> {
+    /// One treasury spend per order and kind. A different one may be signed only once the
+    /// earlier one can no longer be mined (unmined and past its expiry height); otherwise
+    /// both could land.
+    async fn may_sign(&self, kind: RoundKind, order_id: &str, txid: &str) -> Result<(), String> {
+        let sql = match kind {
+            RoundKind::Refund => "SELECT refund_tx, refund_expiry FROM orders WHERE id = ?1",
+            RoundKind::Payout => "SELECT txid, expiry FROM payouts WHERE order_id = ?1",
+        };
         let prev: Option<(Option<String>, Option<u32>)> = {
             let db = self.db.lock().await;
-            db.query_row("SELECT refund_tx, refund_expiry FROM orders WHERE id = ?1", [order_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?
+            db.query_row(sql, [order_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?
         };
         let Some((Some(prev), expiry)) = prev else { return Ok(()) };
         if prev == txid {
             return Ok(());
         }
+        let what = kind.as_str();
         let w = self.wallet.lock().await;
         let mined = w.tx_mined_height(&prev).map_err(|e| e.to_string())?;
         let tip = w.heights().map_err(|e| e.to_string())?.1.unwrap_or(0);
         match (mined, expiry) {
             (None, Some(e)) if e > 0 && tip > e => Ok(()),
-            (Some(h), _) => Err(format!("refund {prev} for this order was already mined at height {h}")),
-            _ => Err(format!("already signed refund {prev} for this order; it can still be mined")),
+            (Some(h), _) => Err(format!("{what} {prev} for this order was already mined at height {h}")),
+            _ => Err(format!("already signed {what} {prev} for this order; it can still be mined")),
         }
     }
 
-    /// Round 1 of a refund signing round. Every check uses this operator's own data: its
-    /// stored proposal (refund address), its own wallet (what arrived, and when), and the
-    /// vault (the order is still open). Only then does it commit nonces.
+    /// Refund checks, from this operator's own data: its stored proposal (refund address),
+    /// its own wallet (what arrived, and when), and the vault (the order is still open).
+    /// Returns who must be paid and the check to run on the transaction.
+    async fn refund_terms(&self, order_id: &str) -> Result<(String, u64), String> {
+        let stored: Option<String> = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT proposal FROM orders WHERE id = ?1", [order_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?
+        };
+        let proposal: Proposal = serde_json::from_str(&stored.ok_or_else(|| format!("unknown order {order_id}"))?).map_err(|e| e.to_string())?;
+        let refund_address = proposal.refund_address.clone().ok_or("order has no refund address")?;
+        let order = self.vault.order(order_id).await.map_err(|e| e.to_string())?.ok_or("order is not on the vault")?;
+        if order.state != "open" {
+            return Err(format!("order is {} on the vault, not open", order.state));
+        }
+        let received = match self.deposit_status(&proposal).await.map_err(|e| e.to_string())? {
+            DepositStatus::Late { received_zat } => received_zat,
+            DepositStatus::Underpaid { received_zat } if now_ns() > proposal.terms.deposit_deadline => received_zat,
+            other => return Err(format!("deposit does not call for a refund ({other:?})")),
+        };
+        Ok((refund_address, received))
+    }
+
+    /// Payout checks: the order is a direction-2 lock that is still awaiting settlement and
+    /// within its deadline, and the tokens locked buy the ZEC asked for at this operator's
+    /// own price. Returns the payout address and the exact amount.
+    async fn payout_terms(&self, order_id: &str) -> Result<(String, u64), String> {
+        let order = self.vault.order(order_id).await.map_err(|e| e.to_string())?.ok_or("order is not on the vault")?;
+        if order.direction != "near_to_zec" {
+            return Err("not a direction-2 order".into());
+        }
+        if order.state != "locked" {
+            return Err(format!("order is {} on the vault, not locked", order.state));
+        }
+        if now_ns() > order.terms.deposit_deadline {
+            return Err("the order's payout deadline has passed".into());
+        }
+        let address = order.zec_address.clone().ok_or("order has no payout address")?;
+        let amount_in: u128 = order.escrow.parse().map_err(|_| "bad escrow amount".to_string())?;
+        let price = self.prices.zec_usd().await;
+        check_payout_terms(amount_in, order.terms.zec_amount_zat, price, &self.limits).map_err(|r| r.to_string())?;
+        Ok((address, order.terms.zec_amount_zat))
+    }
+
+    /// Round 1 of a treasury signing round. The operator checks the order with its own data
+    /// and the transaction against the order; only then does it commit nonces.
     async fn round1(&self, req: Round1Request) -> Result<Round1Response, (StatusCode, String)> {
         let refuse = |m: String| (StatusCode::UNPROCESSABLE_ENTITY, m);
         let share = self.frost.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "this operator has no FROST share configured".to_string()))?;
-        let stored: Option<String> = {
-            let db = self.db.lock().await;
-            db.query_row("SELECT proposal FROM orders WHERE id = ?1", [&req.order_id], |r| r.get(0)).optional().map_err(internal)?
-        };
-        let proposal = stored.ok_or_else(|| refuse(format!("unknown order {}", req.order_id)))?;
-        let proposal: Proposal = serde_json::from_str(&proposal).map_err(internal)?;
-        let refund_address = proposal.refund_address.clone().ok_or_else(|| refuse("order has no refund address".into()))?;
-        let order = self.vault.order(&req.order_id).await.map_err(internal)?.ok_or_else(|| refuse("order is not on the vault".into()))?;
-        if order.state != "open" {
-            return Err(refuse(format!("order is {} on the vault, not open", order.state)));
+        let what = req.kind.as_str();
+        let (to, amount) = match req.kind {
+            RoundKind::Refund => self.refund_terms(&req.order_id).await,
+            RoundKind::Payout => self.payout_terms(&req.order_id).await,
         }
-        let received = match self.deposit_status(&proposal).await.map_err(internal)? {
-            DepositStatus::Late { received_zat } => received_zat,
-            DepositStatus::Underpaid { received_zat } if now_ns() > proposal.terms.deposit_deadline => received_zat,
-            other => return Err(refuse(format!("deposit does not call for a refund ({other:?})"))),
-        };
+        .map_err(|m| {
+            tracing::warn!(order = %req.order_id, kind = what, reason = %m, "refused to sign");
+            refuse(m)
+        })?;
 
         let pczt = base64::engine::general_purpose::STANDARD.decode(&req.pczt).map_err(bad_request)?;
         let request = ssl_sign::prepare(&pczt).map_err(bad_request)?;
         let txid = txid_from_sighash(&request.sighash).unwrap_or_default();
-        self.may_sign_refund(&req.order_id, &txid).await.map_err(refuse)?;
-        let checked = {
+        self.may_sign(req.kind, &req.order_id, &txid).await.map_err(refuse)?;
+        let checked: Result<u64, RefundRejection> = {
             let w = self.wallet.lock().await;
             let tip = w.heights().map_err(internal)?.0.unwrap_or(0);
             let expiry = request.effects.expiry_height;
             if expiry == 0 || expiry > tip + MAX_REFUND_EXPIRY_BLOCKS {
-                return Err(refuse(format!("refund expiry height {expiry} is not within {MAX_REFUND_EXPIRY_BLOCKS} blocks of {tip}")));
+                return Err(refuse(format!("{what} expiry height {expiry} is not within {MAX_REFUND_EXPIRY_BLOCKS} blocks of {tip}")));
             }
-            let receiver = w.orchard_receiver(&refund_address).map_err(internal)?;
-            check_refund(&refund_tx(&request.effects), &receiver, received, self.max_refund_fee_zat, |a| w.is_treasury(a))
+            let receiver = w.orchard_receiver(&to).map_err(|e| refuse(format!("{what} address: {e}")))?;
+            let tx = refund_tx(&request.effects);
+            match req.kind {
+                RoundKind::Refund => check_refund(&tx, &receiver, amount, self.max_refund_fee_zat, |a| w.is_treasury(a)),
+                RoundKind::Payout => check_payout(&tx, &receiver, amount, self.max_refund_fee_zat, |a| w.is_treasury(a)),
+            }
         };
-        let refunded = checked.map_err(|r| {
-            tracing::warn!(order = %req.order_id, rejection = %r, "refused to sign refund");
+        let paid = checked.map_err(|r| {
+            tracing::warn!(order = %req.order_id, kind = what, rejection = %r, "refused to sign");
             refuse(r.to_string())
         })?;
 
@@ -328,9 +396,16 @@ impl Node {
         rounds.retain(|_, r| r.opened.elapsed() < ROUND_TTL);
         rounds.insert(
             req.round_id.clone(),
-            OpenRound { order_id: req.order_id.clone(), sighash, expiry_height: request.effects.expiry_height, spends, opened: std::time::Instant::now() },
+            OpenRound {
+                kind: req.kind,
+                order_id: req.order_id.clone(),
+                sighash,
+                expiry_height: request.effects.expiry_height,
+                spends,
+                opened: std::time::Instant::now(),
+            },
         );
-        tracing::info!(order = %req.order_id, round = %req.round_id, refunded, "committed to refund round");
+        tracing::info!(order = %req.order_id, round = %req.round_id, kind = what, paid, "committed to signing round");
         Ok(Round1Response { identifier: share.identifier_hex(), sighash: request.sighash, commitments })
     }
 
@@ -343,9 +418,9 @@ impl Node {
             return Err(bad_request("round expired"));
         }
         let txid = txid_from_sighash(&hex::encode(&round.sighash)).unwrap_or_default();
-        // Decide and record under one lock: once shares leave, this is the order's refund.
+        // Decide and record under one lock: once shares leave, this is the order's spend.
         let _signing = self.signing.lock().await;
-        self.may_sign_refund(&round.order_id, &txid).await.map_err(|m| (StatusCode::UNPROCESSABLE_ENTITY, m))?;
+        self.may_sign(round.kind, &round.order_id, &txid).await.map_err(|m| (StatusCode::UNPROCESSABLE_ENTITY, m))?;
         let mut shares = vec![];
         for (pool, index, alpha, nonces) in round.spends {
             let pkg = req
@@ -358,11 +433,61 @@ impl Node {
         }
         {
             let db = self.db.lock().await;
-            db.execute("UPDATE orders SET refund_tx = ?1, refund_expiry = ?2 WHERE id = ?3", params![txid, round.expiry_height, round.order_id]).map_err(internal)?;
+            match round.kind {
+                RoundKind::Refund => db.execute(
+                    "UPDATE orders SET refund_tx = ?1, refund_expiry = ?2 WHERE id = ?3",
+                    params![txid, round.expiry_height, round.order_id],
+                ),
+                RoundKind::Payout => db.execute(
+                    "INSERT INTO payouts (order_id, txid, expiry, created_ns) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(order_id) DO UPDATE SET txid = excluded.txid, expiry = excluded.expiry",
+                    params![round.order_id, txid, round.expiry_height, now_ns() as i64],
+                ),
+            }
+            .map_err(internal)?;
         }
         self.status.lock().await.last_signature_at = Some(now_ns());
-        tracing::info!(order = %round.order_id, refund_tx = %txid, "signed refund");
+        tracing::info!(order = %round.order_id, kind = round.kind.as_str(), tx = %txid, "signed treasury spend");
         Ok(Round2Response { identifier: share.identifier_hex(), shares })
+    }
+
+    /// Direction 2, after signing: claims settlement once this operator's wallet sees the
+    /// payout mined at depth, and finalizes the claim once the challenge window has closed.
+    async fn settle_payout(&self, id: &str, txid: &str, claimed: bool) -> Result<()> {
+        let Some(order) = self.vault.order(id).await? else { return Ok(()) };
+        match order.state.as_str() {
+            "locked" if !claimed && !order.approvers.contains(&self.signer.account_id) => {
+                let (mined, tip) = {
+                    let w = self.wallet.lock().await;
+                    (w.tx_mined_height(txid)?, w.heights()?.1.unwrap_or(0))
+                };
+                if mined.map_or(0, |h| tip.saturating_sub(h) + 1) < self.confirmations {
+                    return Ok(());
+                }
+                let outcome = self.vault.claim_settlement(&self.signer, id, txid).await?;
+                if let Some(f) = outcome.failure {
+                    anyhow::bail!("claim_settlement failed: {f}");
+                }
+                self.db.lock().await.execute("UPDATE payouts SET claim_tx = ?1 WHERE order_id = ?2", params![outcome.tx_hash, id])?;
+                self.status.lock().await.last_signature_at = Some(now_ns());
+                tracing::info!(order = id, tx = %outcome.tx_hash, payout = txid, "claimed settlement");
+            }
+            "claimed" => {
+                let claimed_at: u64 = order.claimed_at.parse().unwrap_or(u64::MAX);
+                if now_ns() > claimed_at.saturating_add(self.challenge_window_ns) {
+                    let outcome = self.vault.finalize_settlement(&self.signer, id).await?;
+                    if outcome.failure.is_none() {
+                        self.db.lock().await.execute("UPDATE payouts SET finalize_tx = ?1 WHERE order_id = ?2", params![outcome.tx_hash, id])?;
+                        tracing::info!(order = id, tx = %outcome.tx_hash, "finalized settlement");
+                    }
+                }
+            }
+            "settled" | "reimbursed" | "compensated" => {
+                self.db.lock().await.execute("UPDATE payouts SET final_state = ?1 WHERE order_id = ?2", params![order.state, id])?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn deposit_status(&self, p: &Proposal) -> Result<DepositStatus> {
@@ -417,6 +542,20 @@ impl Node {
                 self.status.lock().await.last_error = Some(format!("{id}: {e}"));
             }
         }
+        let payouts: Vec<(String, String, bool)> = {
+            let db = self.db.lock().await;
+            let mut stmt = match db.prepare("SELECT order_id, txid, claim_tx IS NOT NULL FROM payouts WHERE final_state IS NULL") {
+                Ok(s) => s,
+                Err(e) => return tracing::error!(error = %e, "listing payouts"),
+            };
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+        };
+        for (id, txid, claimed) in payouts {
+            if let Err(e) = self.settle_payout(&id, &txid, claimed).await {
+                tracing::warn!(order = %id, error = %e, "settling payout");
+                self.status.lock().await.last_error = Some(format!("{id}: {e}"));
+            }
+        }
     }
 
     async fn health(&self) -> Value {
@@ -425,7 +564,13 @@ impl Node {
         // Counted from the database so the figure survives restarts.
         let signatures: i64 = {
             let db = self.db.lock().await;
-            db.query_row("SELECT COUNT(approved_tx) + COUNT(release_tx) + COUNT(refund_tx) + COUNT(refund_approval_tx) FROM orders", [], |r| r.get(0)).unwrap_or(0)
+            db.query_row(
+                "SELECT (SELECT COUNT(approved_tx) + COUNT(release_tx) + COUNT(refund_tx) + COUNT(refund_approval_tx) FROM orders)
+                      + (SELECT COUNT(*) + COUNT(claim_tx) + COUNT(finalize_tx) FROM payouts)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
         };
         let s = self.status.lock().await;
         let fresh = s.last_sync_ok.is_some_and(|t| now_ns().saturating_sub(t) < 120_000_000_000);
@@ -625,6 +770,7 @@ async fn main() -> Result<()> {
         rounds: Mutex::new(HashMap::new()),
         signing: Mutex::new(()),
         max_refund_fee_zat: config::num("MAX_REFUND_FEE_ZAT", 20_000)?,
+        challenge_window_ns: vault_config.challenge_window_ns.parse().unwrap_or(6 * 3600 * 1_000_000_000),
     });
     tracing::info!(account = %node.signer.account_id, vault = %node.vault.contract, %listen, "operator starting");
 
