@@ -213,6 +213,13 @@ User locks USDC with `lock_for_zec`, naming a shielded address. The coordinator 
 
 **Exit:** a round trip of ZEC → USDC → ZEC on testnet, plus a challenged settlement that resolves correctly in each direction.
 
+> **Status (2026-10-23): direction 2 runs on testnet up to the challenge window.** See [protocol/README.md](../protocol/README.md#direction-2-usdc-on-near--shielded-zec).
+> - `zp-8-474c84`: the coordinator quoted 1.5 test USDC → 0.001208 ZEC. `arb2` locked the USDC with the quoted `ft_transfer_call` (`F4AoJqRJ…`).
+> - All three operators checked the order against their own price and the transaction against the vault's terms. Two signed, and the payout `72fb8cbb…` was broadcast about 25 s after the lock was seen. The user wallet received exactly 0.001208 ZEC (block 4533373).
+> - Both signers then posted `claim_settlement` with that txid, and the vault moved the order to `claimed`. `finalize_settlement` runs on its own after the 6-hour challenge window.
+> - The website has a NEAR wallet connection (Wallet Selector: MyNearWallet, Meteor) and a USDC → ZEC page at `/app/swap/to-zec`. Order pages show the payout address, payout transaction and claim progress.
+> - **Not yet run:** finalization after the window, a challenged claim resolved by the arbiters, and `reclaim` after a missed deadline.
+
 ### Phase 8 — Production operations on testnet
 
 - **Separate operators:** three people, three cloud accounts, three regions. Each operator holds their own share and their own NEAR key; no one has access to another's host.
