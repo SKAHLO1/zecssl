@@ -3,11 +3,23 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Refunds are the only treasury spend in direction 1.
+/// What a treasury spend is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoundKind {
+    /// Direction 1: an underpaid or late deposit goes back to the user's refund address.
     Refund,
+    /// Direction 2: the ZEC a user locked vault tokens for goes to their shielded address.
+    Payout,
+}
+
+impl RoundKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoundKind::Refund => "refund",
+            RoundKind::Payout => "payout",
+        }
+    }
 }
 
 /// Round 1: here is the proven, unsigned transaction; check it and commit.
