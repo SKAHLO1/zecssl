@@ -130,6 +130,7 @@ interface ContractOrder {
   opened_at: string;
   closed_at: string;
   claimed_at: string;
+  zcash_txid?: string | null;
 }
 
 const orderStates: Record<string, OrderState> = {
@@ -383,9 +384,22 @@ export async function orderDetail(id: string): Promise<OrderDetail> {
           releaseApprovals: onChain.release_approvals,
           refundApprovals: onChain.refund_approvals,
           releaseDeadline: onChain.release_deadline !== "0" ? nsToIso(onChain.release_deadline) : null,
+          claimedTxid: onChain.zcash_txid ?? null,
+          claimedAt: onChain.claimed_at && onChain.claimed_at !== "0" ? nsToIso(onChain.claimed_at) : null,
         }
       : null,
   };
+}
+
+/** Asks the coordinator for a direction-2 quote and the transfer that locks the tokens. */
+export async function createPayout(body: unknown) {
+  const { data } = await fetchJson<unknown>(`${config.coordinatorUrl}/v1/payouts`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    timeoutMs: 15_000,
+  });
+  return data;
 }
 
 /** Forwards an order request to the coordinator, which owns quoting and deposit addresses. */
