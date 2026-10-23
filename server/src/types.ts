@@ -274,6 +274,9 @@ export interface OrderDetail extends Order {
   recipient: string;
   /** The Zcash refund transaction, once sent. */
   refundTxid: string | null;
+  /** Direction 2: where the ZEC goes, and the payout transaction once sent. */
+  payoutAddress?: string | null;
+  payoutTxid?: string | null;
   /** From the vault contract: who approved opening and releasing, and the deadlines. */
   vault: {
     contract: string;
@@ -282,8 +285,28 @@ export interface OrderDetail extends Order {
     releaseApprovals: string[];
     refundApprovals: string[];
     releaseDeadline: string | null;
+    /** Direction 2: the Zcash txid operators claimed, and when the claim reached threshold. */
+    claimedTxid?: string | null;
+    claimedAt?: string | null;
   } | null;
   events: NetworkEvent[];
+}
+
+/** POST /v1/payouts: a direction-2 quote and the transfer that locks the tokens. */
+export interface PayoutQuote {
+  id: string;
+  state: "quoted";
+  amountIn: string;
+  amountInRaw: string;
+  symbol: string;
+  zecAmount: string;
+  zecAmountZat: string;
+  zecAddress: string;
+  expiresAt: string;
+  token: string;
+  vault: string;
+  /** Arguments of ft_transfer_call on `token`, sent with 1 yoctoNEAR attached. */
+  transfer: { receiver_id: string; amount: string; msg: string };
 }
 
 export interface AccountStatus {
