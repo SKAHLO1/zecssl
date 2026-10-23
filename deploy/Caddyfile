@@ -1,0 +1,6 @@
+# HTTPS for the API. Caddy gets and renews the certificate itself; API_DOMAIN must point at
+# this machine (a free <ip-with-dashes>.sslip.io name works without buying a domain).
+{$API_DOMAIN} {
+	encode gzip
+	reverse_proxy api:4000
+}
