@@ -1,4 +1,4 @@
-import type { AccountStatus, ChartRange, FaucetInfo, OrderDetail, Overview, PriceChart, Quote, QuoteRequest } from "./types";
+import type { AccountStatus, ChartRange, FaucetInfo, OrderDetail, Overview, PayoutQuote, PriceChart, Quote, QuoteRequest } from "./types";
 
 /** Base URL the browser uses. */
 export const publicApiUrl = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(/\/$/, "");
@@ -43,6 +43,8 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ accountId }),
     }),
+  createPayout: (body: { amountIn: string; account: string; zecAddress: string }) =>
+    call<PayoutQuote>("/v1/payouts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   createOrder: (body: unknown) =>
     call<unknown>("/v1/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
 };
