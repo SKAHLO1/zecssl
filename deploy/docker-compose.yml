@@ -1,0 +1,107 @@
+# The ZEC SSL backend on one machine: coordinator, three operators, the read API, and Caddy
+# for HTTPS. The website deploys separately (Vercel). See docs/deploy-oracle.md.
+#
+#   cd deploy && docker compose up -d --build
+#
+# Secrets come from deploy/.env (made by make-env.sh; never committed). Only Caddy publishes
+# ports; the coordinator and operators are reachable only on the internal network.
+#
+# One machine for all three operators is fine on testnet. In production each operator runs on
+# its own host, run by a different party.
+
+x-protocol: &protocol
+  build: { context: ../protocol, dockerfile: Dockerfile }
+  image: zec-ssl-protocol
+  restart: unless-stopped
+  environment: &protocol-env
+    ZCASH_NETWORK: test
+    LIGHTWALLETD_URL: https://testnet.zec.rocks:443
+    NEAR_RPC_URL: https://rpc.testnet.fastnear.com
+    NEAR_VAULT_CONTRACT: ${NEAR_VAULT_CONTRACT:?}
+    TREASURY_UFVK: ${TREASURY_UFVK:?}
+    WALLET_BIRTHDAY: ${WALLET_BIRTHDAY:?}
+    CONFIRMATIONS: ${CONFIRMATIONS:-10}
+    OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?}
+    FROST_PUBLIC_KEY_PACKAGE: ${FROST_PUBLIC_KEY_PACKAGE:?}
+    RUST_LOG: info
+
+services:
+  coordinator:
+    <<: *protocol
+    command: ssl-coordinator
+    environment:
+      <<: *protocol-env
+      COORDINATOR_LISTEN: 0.0.0.0:7000
+      OPERATORS: ${OP1_ACCOUNT}=http://operator-1:7101,${OP2_ACCOUNT}=http://operator-2:7101,${OP3_ACCOUNT}=http://operator-3:7101
+      DEPOSIT_WINDOW_MINS: ${DEPOSIT_WINDOW_MINS:-30}
+      SPREAD_BPS: ${SPREAD_BPS:-25}
+    volumes: [coordinator:/var/data]
+    depends_on: [operator-1, operator-2, operator-3]
+
+  operator-1:
+    <<: *protocol
+    command: ssl-operator
+    environment:
+      <<: *protocol-env
+      OPERATOR_LISTEN: 0.0.0.0:7101
+      NEAR_ACCOUNT_ID: ${OP1_ACCOUNT:?}
+      NEAR_SECRET_KEY: ${OP1_NEAR_KEY:?}
+      FROST_KEY_PACKAGE: ${OP1_FROST_KEY_PACKAGE:?}
+    volumes: [operator-1:/var/data]
+
+  operator-2:
+    <<: *protocol
+    command: ssl-operator
+    environment:
+      <<: *protocol-env
+      OPERATOR_LISTEN: 0.0.0.0:7101
+      NEAR_ACCOUNT_ID: ${OP2_ACCOUNT:?}
+      NEAR_SECRET_KEY: ${OP2_NEAR_KEY:?}
+      FROST_KEY_PACKAGE: ${OP2_FROST_KEY_PACKAGE:?}
+    volumes: [operator-2:/var/data]
+
+  operator-3:
+    <<: *protocol
+    command: ssl-operator
+    environment:
+      <<: *protocol-env
+      OPERATOR_LISTEN: 0.0.0.0:7101
+      NEAR_ACCOUNT_ID: ${OP3_ACCOUNT:?}
+      NEAR_SECRET_KEY: ${OP3_NEAR_KEY:?}
+      FROST_KEY_PACKAGE: ${OP3_FROST_KEY_PACKAGE:?}
+    volumes: [operator-3:/var/data]
+
+  api:
+    build: { context: .., dockerfile: server/Dockerfile }
+    image: zec-ssl-api
+    restart: unless-stopped
+    environment:
+      NEAR_NETWORK: testnet
+      NEAR_RPC_URL: https://rpc.testnet.fastnear.com
+      NEAR_VAULT_CONTRACT: ${NEAR_VAULT_CONTRACT}
+      COORDINATOR_URL: http://coordinator:7000
+      OPERATOR_ENDPOINTS: ${OP1_ACCOUNT}=http://operator-1:7101,${OP2_ACCOUNT}=http://operator-2:7101,${OP3_ACCOUNT}=http://operator-3:7101
+      CORS_ORIGINS: ${CORS_ORIGINS:?}
+      TRUST_PROXY: "true"
+      NEAR_FAUCET_ACCOUNT: ${NEAR_FAUCET_ACCOUNT:-}
+      NEAR_FAUCET_KEY: ${NEAR_FAUCET_KEY:-}
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+    depends_on: [coordinator]
+
+  caddy:
+    image: caddy:2.10.2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    depends_on: [api]
+
+volumes:
+  coordinator:
+  operator-1:
+  operator-2:
+  operator-3:
+  caddy:
