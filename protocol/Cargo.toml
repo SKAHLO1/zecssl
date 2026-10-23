@@ -1,5 +1,5 @@
 [workspace]
-members = ["ssl-sign", "ssl-near", "ssl-wallet", "ssl-policy", "ssl-node"]
+members = ["ssl-sign", "ssl-near", "ssl-wallet", "ssl-policy", "ssl-node", "ssl-frost"]
 resolver = "2"
 
 [workspace.package]

@@ -51,8 +51,11 @@ pub struct ShieldedOutput {
     pub index: usize,
     /// Zatoshis. `None` if the PCZT has been redacted.
     pub value: Option<u64>,
-    /// The encoded address the creator recorded for this output, when present.
+    /// The encoded address the creator recorded for this output, when present. Metadata
+    /// only: policy must check `recipient`, which is what the note actually pays.
     pub address: Option<String>,
+    /// The note's actual recipient: the raw 43-byte Orchard-protocol address, hex.
+    pub recipient: Option<String>,
 }
 
 /// What a transaction does, in the terms the operator policy checks.
@@ -64,6 +67,12 @@ pub struct Effects {
     pub sapling_spends: usize,
     pub sapling_outputs: usize,
     pub outputs: Vec<ShieldedOutput>,
+    /// Total value of the real (non-dummy) Orchard-protocol notes spent, in zatoshis.
+    /// `None` if any spend's value is redacted.
+    pub spent_zat: Option<u64>,
+    /// The last block the transaction can be mined in; 0 means it never expires.
+    #[serde(default)]
+    pub expiry_height: u32,
 }
 
 impl Effects {
@@ -101,20 +110,21 @@ fn pools_for(version: TxVersion) -> &'static [Pool] {
 /// The shielded sighash. Ironwood lives only in v6 transactions, whose sighash commits to
 /// the Ironwood bundle; using the v5 hash would sign successfully here and then be
 /// rejected at broadcast.
-fn sighash(pczt: &Pczt) -> Result<(TxVersion, [u8; 32])> {
+fn sighash(pczt: &Pczt) -> Result<(TxVersion, [u8; 32], u32)> {
     let tx_data = pczt
         .clone()
         .into_effects()
         .map_err(|e| anyhow!("PCZT lacks the data to compute its effects: {e:?}"))?;
     let txid_parts = tx_data.digest(TxIdDigester);
     let version = tx_data.version();
+    let expiry = u32::from(tx_data.expiry_height());
     let hash = match version {
         TxVersion::V6 => v6_signature_hash(&tx_data, &SignableInput::Shielded, &txid_parts),
         TxVersion::V5 => v5_signature_hash(&tx_data, &SignableInput::Shielded, &txid_parts),
         other => bail!("unsupported transaction version {other:?}"),
     };
     let bytes: [u8; 32] = hash.as_ref().try_into().context("sighash is not 32 bytes")?;
-    Ok((version, bytes))
+    Ok((version, bytes, expiry))
 }
 
 /// Runs `f` over the bundle of `pool`, through the low-level signer.
@@ -134,16 +144,23 @@ where
 
 pub fn prepare(pczt_bytes: &[u8]) -> Result<SigningRequest> {
     let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("invalid PCZT: {e:?}"))?;
-    let (version, hash) = sighash(&pczt)?;
+    let (version, hash, expiry_height) = sighash(&pczt)?;
 
     let mut spends = vec![];
     let mut outputs = vec![];
+    let mut spent = 0u64;
+    let mut spent_known = true;
     for &pool in pools_for(version) {
         let mut found_spends = vec![];
         let mut found_outputs = vec![];
         with_bundle(Signer::new(pczt.clone()), pool, |bundle| -> Result<(), OrchardParseError> {
             for (index, action) in bundle.actions().iter().enumerate() {
                 let spend = action.spend();
+                // Dummy spends carry a zero value; real ones carry the note's value.
+                match spend.value().map(|v| v.inner()) {
+                    Some(v) => spent += v,
+                    None => spent_known = false,
+                }
                 // Real spends await a signature; dummy spends were signed by the IO finalizer.
                 if spend.spend_auth_sig().is_none() {
                     if let Some(alpha) = spend.alpha() {
@@ -154,7 +171,8 @@ pub fn prepare(pczt_bytes: &[u8]) -> Result<SigningRequest> {
                 let value = output.value().map(|v| v.inner());
                 // Zero-valued outputs with no recorded address are padding.
                 if value.unwrap_or(0) > 0 || output.user_address().is_some() {
-                    found_outputs.push(ShieldedOutput { pool, index, value, address: output.user_address().clone() });
+                    let recipient = output.recipient().map(|a| hex::encode(a.to_raw_address_bytes()));
+                    found_outputs.push(ShieldedOutput { pool, index, value, address: output.user_address().clone(), recipient });
                 }
             }
             Ok(())
@@ -174,6 +192,8 @@ pub fn prepare(pczt_bytes: &[u8]) -> Result<SigningRequest> {
             sapling_spends: pczt.sapling().spends().len(),
             sapling_outputs: pczt.sapling().outputs().len(),
             outputs,
+            spent_zat: spent_known.then_some(spent),
+            expiry_height,
         },
     })
 }
@@ -195,7 +215,7 @@ impl From<OrchardParseError> for ApplyError {
 pub fn apply(pczt_bytes: &[u8], signatures: &[SpendSignature]) -> Result<Vec<u8>> {
     let pczt = Pczt::parse(pczt_bytes).map_err(|e| anyhow!("invalid PCZT: {e:?}"))?;
     let request = prepare(pczt_bytes)?;
-    let (version, hash) = sighash(&pczt)?;
+    let (version, hash, _) = sighash(&pczt)?;
 
     for spend in &request.spends {
         if !signatures.iter().any(|s| s.pool == spend.pool && s.index == spend.index) {

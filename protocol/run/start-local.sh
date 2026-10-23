@@ -12,6 +12,9 @@
 #   BIRTHDAY     wallet birthday height (default: 4524400, the spike treasury's)
 #   CONFIRMATIONS                (default: 10)
 #   STATE        state root (default: ~/zec-ssl-run)
+#   SPIKE        where the Phase 2 DKG left the FROST shares, operators/opN.toml and
+#                group.key (default: ~/zec-ssl-spike); without them refunds are not signed
+#   DEPOSIT_WINDOW_MINS          (default: 30)
 set -euo pipefail
 
 : "${VAULT:?set VAULT}"
@@ -21,6 +24,7 @@ BIN="${BIN:-$DEPS/target-protocol/release}"
 STATE="${STATE:-$HOME/zec-ssl-run}"
 UFVK_FILE="${UFVK_FILE:-$HOME/zec-ssl-spike/ufvk.txt}"
 CREDS="$HOME/.near-credentials/testnet"
+SPIKE="${SPIKE:-$HOME/zec-ssl-spike}"
 mkdir -p "$STATE"
 chmod 700 "$STATE"
 
@@ -36,6 +40,7 @@ common=(
   TREASURY_UFVK="@$UFVK_FILE"
   WALLET_BIRTHDAY="${BIRTHDAY:-4524400}"
   CONFIRMATIONS="${CONFIRMATIONS:-10}"
+  DEPOSIT_WINDOW_MINS="${DEPOSIT_WINDOW_MINS:-30}"
   OPERATOR_API_TOKEN="$(cat "$TOKEN_FILE")"
   RUST_LOG="${RUST_LOG:-info}"
 )
@@ -44,10 +49,16 @@ pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+# Each operator gets only its own FROST share; the coordinator gets the public key
+# package, which every share's config also carries.
+frost() { [ -f "$SPIKE/group.key" ] && echo "FROST_CONFIG=$SPIKE/operators/$1.toml FROST_GROUP_KEY=$(cat "$SPIKE/group.key")"; }
+[ -f "$SPIKE/group.key" ] || echo "no FROST group in $SPIKE: refunds will not be signed"
+
 for i in 1 2 3; do
   account="$PREFIX-op$i.testnet"
   [ -f "$CREDS/$account.json" ] || { echo "missing key for $account in $CREDS"; exit 1; }
-  env "${common[@]}" \
+  # shellcheck disable=SC2046 # frost prints space-free NAME=value pairs
+  env "${common[@]}" $(frost "op$i") \
     OPERATOR_LISTEN="127.0.0.1:710$i" \
     NEAR_CREDENTIALS="$CREDS/$account.json" \
     STATE_DIR="$STATE/op$i" \
@@ -56,7 +67,8 @@ for i in 1 2 3; do
   echo "operator $i ($account) on :710$i, log $STATE/op$i.log"
 done
 
-env "${common[@]}" \
+# shellcheck disable=SC2046
+env "${common[@]}" $(frost op1) \
   COORDINATOR_LISTEN=127.0.0.1:7000 \
   OPERATORS="$PREFIX-op1.testnet=http://127.0.0.1:7101,$PREFIX-op2.testnet=http://127.0.0.1:7102,$PREFIX-op3.testnet=http://127.0.0.1:7103" \
   STATE_DIR="$STATE/coordinator" \

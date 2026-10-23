@@ -40,6 +40,7 @@ const progress: Record<string, string> = {
   deposit_detected: "Deposit seen, waiting for it to be mined",
   confirming: "Deposit confirming",
   signing: "Deposit confirmed. Operators are approving the release",
+  refunding: "Deposit was short or late. Operators are signing a shielded refund",
   released: "Settled",
   refunded: "Refunded",
   expired: "Expired",

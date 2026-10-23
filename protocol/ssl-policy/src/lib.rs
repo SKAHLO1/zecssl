@@ -34,6 +34,10 @@ pub struct Proposal {
     pub deposit_address: String,
     /// The ZEC/USD price the coordinator quoted from, for the record.
     pub quoted_zec_usd: f64,
+    /// Where a refund may go: the user's shielded unified address. Operators store it at
+    /// approval and only ever sign refunds to it. (Absent on orders from before refunds.)
+    #[serde(default)]
+    pub refund_address: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -168,6 +172,89 @@ pub fn check_against_vault(p: &Proposal, on_vault: Option<&OrderTerms>) -> Resul
     }
 }
 
+/// One output of a refund transaction, as the PCZT describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxOutput {
+    pub value: Option<u64>,
+    /// Raw 43-byte Orchard-protocol recipient. `None` if redacted.
+    pub recipient: Option<[u8; 43]>,
+}
+
+/// What a refund transaction does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefundTx {
+    pub transparent_inputs: usize,
+    pub transparent_outputs: usize,
+    pub sapling_spends: usize,
+    pub sapling_outputs: usize,
+    pub spent_zat: Option<u64>,
+    pub outputs: Vec<TxOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefundRejection {
+    NotShielded,
+    Redacted,
+    /// The transaction pays the refund address less than the deposit minus the fee
+    /// allowance, or more than was deposited.
+    WrongAmount { paid: u64, min: u64, max: u64 },
+    /// An output pays someone other than the refund address or the treasury itself.
+    PaysStranger,
+    FeeTooHigh { fee: u64 },
+}
+
+impl std::fmt::Display for RefundRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefundRejection::NotShielded => f.write_str("refund has transparent or Sapling parts"),
+            RefundRejection::Redacted => f.write_str("refund hides an output's value or recipient"),
+            RefundRejection::WrongAmount { paid, min, max } => write!(f, "refund pays {paid} zat; expected {min}..={max}"),
+            RefundRejection::PaysStranger => f.write_str("refund pays an address that is neither the refund address nor the treasury"),
+            RefundRejection::FeeTooHigh { fee } => write!(f, "refund fee {fee} zat is above the allowance"),
+        }
+    }
+}
+
+/// The checks an operator runs before signing a refund. `refund_receiver` is decoded from
+/// the refund address the operator stored when it approved the order; `received_zat` is
+/// what the operator's own wallet saw arrive. Output *addresses* in a PCZT are metadata, so
+/// only actual recipients count. Returns the amount refunded.
+pub fn check_refund(
+    tx: &RefundTx,
+    refund_receiver: &[u8; 43],
+    received_zat: u64,
+    max_fee_zat: u64,
+    is_treasury: impl Fn(&[u8; 43]) -> bool,
+) -> Result<u64, RefundRejection> {
+    if tx.transparent_inputs + tx.transparent_outputs + tx.sapling_spends + tx.sapling_outputs > 0 {
+        return Err(RefundRejection::NotShielded);
+    }
+    let spent = tx.spent_zat.ok_or(RefundRejection::Redacted)?;
+    let (mut paid, mut total_out) = (0u64, 0u64);
+    for o in &tx.outputs {
+        let value = o.value.ok_or(RefundRejection::Redacted)?;
+        if value == 0 {
+            continue; // padding
+        }
+        let to = o.recipient.ok_or(RefundRejection::Redacted)?;
+        total_out += value;
+        if &to == refund_receiver {
+            paid += value;
+        } else if !is_treasury(&to) {
+            return Err(RefundRejection::PaysStranger);
+        }
+    }
+    let min = received_zat.saturating_sub(max_fee_zat);
+    if paid < min || paid > received_zat || paid == 0 {
+        return Err(RefundRejection::WrongAmount { paid, min, max: received_zat });
+    }
+    let fee = spent.saturating_sub(total_out);
+    if fee > max_fee_zat {
+        return Err(RefundRejection::FeeTooHigh { fee });
+    }
+    Ok(paid)
+}
+
 /// A deposit as an operator's wallet reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeenDeposit {
@@ -266,6 +353,7 @@ mod tests {
             diversifier_index: 1_001,
             deposit_address: "utest1abc".into(),
             quoted_zec_usd: 1_000.0,
+            refund_address: Some("utest1refund".into()),
         }
     }
 
@@ -313,6 +401,61 @@ mod tests {
         let mut p = proposal();
         p.terms.recipient = "Alice.testnet".into();
         assert_eq!(check_proposal(&p, "utest1abc", Some(1_000.0), NOW, &limits()), Err(Rejection::BadRecipient));
+    }
+
+    const USER: [u8; 43] = [1; 43];
+    const TREASURY: [u8; 43] = [2; 43];
+    const STRANGER: [u8; 43] = [3; 43];
+
+    fn refund_tx(outputs: &[(u64, [u8; 43])], spent: u64) -> RefundTx {
+        RefundTx {
+            transparent_inputs: 0,
+            transparent_outputs: 0,
+            sapling_spends: 0,
+            sapling_outputs: 0,
+            spent_zat: Some(spent),
+            outputs: outputs.iter().map(|(v, r)| TxOutput { value: Some(*v), recipient: Some(*r) }).collect(),
+        }
+    }
+
+    fn is_treasury(a: &[u8; 43]) -> bool {
+        *a == TREASURY
+    }
+
+    #[test]
+    fn a_correct_refund_passes() {
+        // 900,000 received; refund 880,000 to the user; 100,000 change; fee 20,000 from a 1,000,000 note.
+        let tx = refund_tx(&[(880_000, USER), (100_000, TREASURY)], 1_000_000);
+        assert_eq!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Ok(880_000));
+    }
+
+    #[test]
+    fn a_coordinator_cannot_redirect_or_skim_a_refund() {
+        // Pays a stranger instead of the user.
+        let tx = refund_tx(&[(880_000, STRANGER), (100_000, TREASURY)], 1_000_000);
+        assert!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury).is_err());
+        // Pays the user, but sends part of the change to a stranger.
+        let tx = refund_tx(&[(880_000, USER), (50_000, STRANGER), (50_000, TREASURY)], 1_000_000);
+        assert_eq!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::PaysStranger));
+        // Refunds less than the deposit minus the allowance.
+        let tx = refund_tx(&[(500_000, USER), (480_000, TREASURY)], 1_000_000);
+        assert!(matches!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::WrongAmount { .. })));
+        // Refunds more than was deposited (drains the treasury).
+        let tx = refund_tx(&[(990_000, USER)], 1_000_000);
+        assert!(matches!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::WrongAmount { .. })));
+        // Burns value as fee.
+        let tx = refund_tx(&[(880_000, USER)], 1_000_000);
+        assert!(matches!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::FeeTooHigh { .. })));
+    }
+
+    #[test]
+    fn transparent_or_redacted_refunds_are_refused() {
+        let mut tx = refund_tx(&[(880_000, USER), (100_000, TREASURY)], 1_000_000);
+        tx.transparent_outputs = 1;
+        assert_eq!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::NotShielded));
+        let mut tx = refund_tx(&[(880_000, USER)], 1_000_000);
+        tx.outputs[0].recipient = None;
+        assert_eq!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::Redacted));
     }
 
     #[test]

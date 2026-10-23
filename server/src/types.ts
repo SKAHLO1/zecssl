@@ -177,6 +177,8 @@ export type OrderState =
   | "deposit_detected"
   | "confirming"
   | "signing"
+  /** Underpaid or late: the operators are signing, or have sent, a shielded refund. */
+  | "refunding"
   | "released"
   | "refunded"
   | "expired"
@@ -270,12 +272,15 @@ export interface OrderDetail extends Order {
   receivedZec: string;
   depositTxids: string[];
   recipient: string;
+  /** The Zcash refund transaction, once sent. */
+  refundTxid: string | null;
   /** From the vault contract: who approved opening and releasing, and the deadlines. */
   vault: {
     contract: string;
     state: string;
     approvers: string[];
     releaseApprovals: string[];
+    refundApprovals: string[];
     releaseDeadline: string | null;
   } | null;
   events: NetworkEvent[];

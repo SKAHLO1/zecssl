@@ -6,6 +6,7 @@
 //! and report the treasury's shielded balance. It holds no spending key.
 
 mod cache;
+mod spend;
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,7 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 use zip32::DiversifierIndex;
 
 pub use cache::MemBlockCache;
+pub use spend::prove;
 
 type Db = WalletDb<rusqlite::Connection, Network, SystemClock, UnwrapErr<SysRng>>;
 
@@ -77,7 +79,7 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-async fn connect(url: &str) -> Result<CompactTxStreamerClient<Channel>> {
+pub(crate) async fn connect(url: &str) -> Result<CompactTxStreamerClient<Channel>> {
     install_crypto_provider();
     let uri: tonic::transport::Uri = url.parse().with_context(|| format!("invalid lightwalletd URL {url}"))?;
     let mut endpoint = Channel::from_shared(url.to_string())?;
@@ -155,7 +157,7 @@ impl TreasuryWallet {
         Ok((tip, scanned))
     }
 
-    fn read_conn(&self) -> Result<rusqlite::Connection> {
+    pub(crate) fn read_conn(&self) -> Result<rusqlite::Connection> {
         Ok(rusqlite::Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?)
     }
 

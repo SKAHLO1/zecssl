@@ -101,6 +101,9 @@ services:
         value: "25"
       - key: DEPOSIT_WINDOW_MINS
         value: "30"
+      # The group's public key package (hex): lets the coordinator run refund rounds.
+      - key: FROST_PUBLIC_KEY_PACKAGE
+        sync: false
 
   - type: pserv
     name: zec-ssl-operator-1
@@ -118,6 +121,11 @@ services:
       - key: NEAR_ACCOUNT_ID
         sync: false
       - key: NEAR_SECRET_KEY
+        sync: false
+      # This operator's FROST share (hex key package) and the group's public key package.
+      - key: FROST_KEY_PACKAGE
+        sync: false
+      - key: FROST_PUBLIC_KEY_PACKAGE
         sync: false
 
   - type: pserv
@@ -137,6 +145,11 @@ services:
         sync: false
       - key: NEAR_SECRET_KEY
         sync: false
+      # This operator's FROST share (hex key package) and the group's public key package.
+      - key: FROST_KEY_PACKAGE
+        sync: false
+      - key: FROST_PUBLIC_KEY_PACKAGE
+        sync: false
 
   - type: pserv
     name: zec-ssl-operator-3
@@ -154,4 +167,9 @@ services:
       - key: NEAR_ACCOUNT_ID
         sync: false
       - key: NEAR_SECRET_KEY
+        sync: false
+      # This operator's FROST share (hex key package) and the group's public key package.
+      - key: FROST_KEY_PACKAGE
+        sync: false
+      - key: FROST_PUBLIC_KEY_PACKAGE
         sync: false

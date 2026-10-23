@@ -21,6 +21,7 @@ protocol/
 - Gives each order a fresh shielded deposit address (diversifier index 1000 + order number).
 - Proposes the order to every operator, and returns the deposit address **only once the vault reports the order open**.
 - Tracks deposits and order state, nudges operators once a deposit is paid, and records events.
+- **Refunds** an underpaid deposit (after the deadline) or a late one: it builds the refund (the deposit minus `REFUND_FEE_ZAT`, to the refund address, with change back to the treasury), proves it, and runs a two-round rerandomized FROST round with the first threshold of operators to commit. It aggregates the shares, checks the extracted transaction is fully shielded, and broadcasts it. A failed round is retried after two minutes with the same transaction.
 - Serves the API the website uses: `/v1/quote`, `/v1/orders`, `/v1/orders/{id}`, `/v1/events`, `/v1/treasury`, `/v1/signing-rounds`, `/health`.
 
 **Operator** (`ssl-operator`). Each runs its own NEAR key, its own wallet and its own price feed, and never trusts the coordinator.
@@ -29,7 +30,15 @@ protocol/
   - the payout doesn't exceed its own ZEC price (after spread, plus tolerance);
   - the order is within its size and deadline bounds;
   - the recipient is a valid NEAR account.
-- **Approving a release:** it approves only when its *own* wallet shows the deposit paid in full, at the required depth, and first mined before the deadline. Underpaid or late deposits are flagged for refund and never released.
+- **Approving a release:** it approves only when its *own* wallet shows the deposit paid in full, at the required depth, and first mined before the deadline. Underpaid or late deposits are never released.
+- **Signing a refund** (`/v1/signing/round1`, `/v1/signing/round2`): before committing nonces, it checks with its own data that:
+  - the order is still open on the vault, and its own wallet shows it underpaid after the deadline, or late;
+  - [`check_refund`](ssl-policy/src/lib.rs) passes: no transparent or Sapling parts, nothing redacted, every output goes to the refund address it stored when it approved the order or back to the treasury, the refund is the deposit minus at most `MAX_REFUND_FEE_ZAT`, and the fee is within that allowance;
+  - the transaction expires within 100 blocks;
+  - it hasn't signed a *different* refund for the order that could still be mined.
+
+  In round 2 it signs only the sighash it computed itself, with its own randomizer. Nonces live only in memory, are used once, and expire after 10 minutes. Once its own wallet sees the refund mined at the required depth, it approves the refund on the vault.
+- **Proposals** must carry a shielded refund address that the operator can decode; it is stored with the order.
 - **Health:** `/health` reports its NEAR account, its bond from the contract, signature count, wallet heights and last error. The website shows these on the Operator network page.
 
 The coordinator authenticates to operators with a shared bearer token. That's not what keeps them safe, though: operators re-check every proposal against their own rules.
@@ -41,7 +50,7 @@ cd protocol && CARGO_TARGET_DIR=~/zec-ssl-deps/target-protocol cargo build --rel
 VAULT=<prefix>-vault.testnet PREFIX=<prefix> bash protocol/run/start-local.sh
 ```
 
-This starts three operators (`:7101`–`:7103`, signing as `<prefix>-op1..3.testnet` from your NEAR CLI keychain) and the coordinator (`:7000`). Each has its own state under `~/zec-ssl-run`. Then set these in `server/.env`:
+This starts three operators (`:7101`–`:7103`, signing as `<prefix>-op1..3.testnet` from your NEAR CLI keychain) and the coordinator (`:7000`). Each operator loads its own FROST share from the Phase 2 DKG (`~/zec-ssl-spike/operators/opN.toml`); the coordinator loads only the public key package. Each has its own state under `~/zec-ssl-run`. Then set these in `server/.env`:
 
 ```
 COORDINATOR_URL=http://127.0.0.1:7000
@@ -54,7 +63,6 @@ The website's swap then quotes from the coordinator, pays out in the vault's tok
 
 ### Not in this phase
 
-- **Refunds** for underpaid or late deposits are FROST-signed Zcash spends (Phase 6). Operators detect and flag them but don't sign them yet.
 - **Direction 2** (USDC → shielded ZEC) is Phase 7.
 - **Independence:** all services share one machine and one lightwalletd here. Production operators run on separate hosts with their own Zebra and Zaino (Phase 8).
 

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod price;
+pub mod signing;
 pub mod vault;
 
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -5,6 +5,9 @@
 //!   address derivation, and approves it on the NEAR vault only if every check passes;
 //! - watches its own wallet for each approved order's deposit and approves the release
 //!   once the deposit is paid in full, confirmed, and on time;
+//! - signs refunds of underpaid or late deposits in a rerandomized FROST round, but only
+//!   after checking the transaction itself (see `ssl_policy::check_refund`), and approves
+//!   the refund on the vault once its own wallet sees it mined;
 //! - reports its health at `GET /health`.
 //!
 //! It never trusts the coordinator: a proposal is just a request to check.
@@ -27,7 +30,12 @@
 //!   MAX_ORDER_USDC           1000
 //!   MIN_ORDER_ZEC            0.001
 //!   SYNC_INTERVAL_SECS       20
+//!   FROST_KEY_PACKAGE + FROST_PUBLIC_KEY_PACKAGE   this operator's FROST share (hex), or
+//!   FROST_CONFIG + FROST_GROUP_KEY                 a frost-client config file and group
+//!                            (optional: without a share the operator cannot sign refunds)
+//!   MAX_REFUND_FEE_ZAT       20000
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,8 +51,11 @@ use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use ssl_near::Signer;
+use base64::Engine as _;
+use ssl_frost::{Share, SigningNonces};
+use ssl_node::signing::{refund_tx, txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, SpendCommitment, SpendShare};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, vault::Vault, VERSION};
-use ssl_policy::{check_against_vault, check_proposal, deposit_status, DepositStatus, Limits, Proposal, SeenDeposit};
+use ssl_policy::{check_against_vault, check_proposal, check_refund, deposit_status, DepositStatus, Limits, Proposal, SeenDeposit};
 use ssl_wallet::{derive_address, parse_network, TreasuryWallet};
 use tokio::sync::Mutex;
 
@@ -59,7 +70,27 @@ struct Node {
     token: String,
     status: Mutex<Status>,
     bond_cache: Mutex<Option<(Option<f64>, std::time::Instant)>>,
+    frost: Option<Share>,
+    /// Open signing rounds. Nonces live only here, in memory, are used once, and expire.
+    rounds: Mutex<HashMap<String, OpenRound>>,
+    /// Held while deciding whether to release signature shares, so two rounds for one
+    /// order cannot both pass the one-refund check.
+    signing: Mutex<()>,
+    max_refund_fee_zat: u64,
 }
+
+struct OpenRound {
+    order_id: String,
+    sighash: Vec<u8>,
+    expiry_height: u32,
+    /// (pool, action index, alpha, nonces) per spend.
+    spends: Vec<(ssl_sign::Pool, usize, [u8; 32], SigningNonces)>,
+    opened: std::time::Instant,
+}
+
+const ROUND_TTL: Duration = Duration::from_secs(600);
+/// A refund must expire soon enough that, if it is never mined, a replacement can be signed.
+const MAX_REFUND_EXPIRY_BLOCKS: u32 = 100;
 
 #[derive(Default)]
 struct Status {
@@ -84,6 +115,15 @@ fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
             first_seen_mined_ns INTEGER NOT NULL
         );",
     )?;
+    // v2: refunds. `refund_tx` is the Zcash txid this operator signed for the order's refund,
+    // `refund_expiry` the last block it can be mined in, and `refund_approval_tx` the NEAR
+    // approve_refund.
+    let has_refund = conn.prepare("SELECT 1 FROM pragma_table_info('orders') WHERE name = 'refund_tx'")?.exists([])?;
+    if !has_refund {
+        conn.execute_batch("ALTER TABLE orders ADD COLUMN refund_tx TEXT;
+             ALTER TABLE orders ADD COLUMN refund_expiry INTEGER;
+             ALTER TABLE orders ADD COLUMN refund_approval_tx TEXT;")?;
+    }
     Ok(conn)
 }
 
@@ -97,6 +137,9 @@ impl Node {
             w.address(p.diversifier_index).map_err(internal)?;
             derived
         };
+        // A refund can only ever go to this address, so it must be one we can pay shielded.
+        let refund_address = p.refund_address.as_deref().ok_or((StatusCode::UNPROCESSABLE_ENTITY, "proposal has no refund address".to_string()))?;
+        self.wallet.lock().await.orchard_receiver(refund_address).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("refund address: {e}")))?;
         let price = self.prices.zec_usd().await;
         // Never approve different terms for an id the vault already has: that is equivocation.
         let existing = self.vault.order(&p.order_id).await.map_err(internal)?;
@@ -157,6 +200,9 @@ impl Node {
         if release_tx.is_some() || order.release_approvals.contains(&self.signer.account_id) {
             return Ok(json!({ "order": id, "decision": "already approved release" }));
         }
+        if let Some(decision) = self.settle_refund(id, &order.refund_approvals).await? {
+            return Ok(decision);
+        }
 
         let status = self.deposit_status(&proposal).await?;
         match &status {
@@ -170,12 +216,153 @@ impl Node {
                 Ok(json!({ "order": id, "decision": "approved release", "tx": outcome.tx_hash, "deposit": status }))
             }
             DepositStatus::Underpaid { .. } | DepositStatus::Late { .. } => {
-                // Refunds are signed with FROST on Zcash (Phase 6); never release.
-                tracing::warn!(order = id, ?status, "deposit needs a refund");
+                // Never release. The coordinator runs a FROST round for the refund.
+                tracing::info!(order = id, ?status, "deposit needs a refund");
                 Ok(json!({ "order": id, "decision": "needs refund", "deposit": status }))
             }
             _ => Ok(json!({ "order": id, "decision": "waiting for deposit", "deposit": status })),
         }
+    }
+
+    /// If this operator signed a refund for the order, approves it on the vault once its own
+    /// wallet sees the refund mined at the required depth.
+    async fn settle_refund(&self, id: &str, approvals: &[String]) -> Result<Option<Value>> {
+        let (refund_tx, approved): (Option<String>, Option<String>) = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT refund_tx, refund_approval_tx FROM orders WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        };
+        let Some(txid) = refund_tx else { return Ok(None) };
+        if approved.is_some() || approvals.contains(&self.signer.account_id) {
+            return Ok(Some(json!({ "order": id, "decision": "already approved refund" })));
+        }
+        let (mined, tip) = {
+            let w = self.wallet.lock().await;
+            (w.tx_mined_height(&txid)?, w.heights()?.1.unwrap_or(0))
+        };
+        let depth = mined.map_or(0, |h| tip.saturating_sub(h) + 1);
+        if depth < self.confirmations {
+            return Ok(Some(json!({ "order": id, "decision": "waiting for refund confirmations", "refundTx": txid, "depth": depth })));
+        }
+        let outcome = self.vault.approve_refund(&self.signer, id).await?;
+        if let Some(f) = outcome.failure {
+            anyhow::bail!("approve_refund failed: {f}");
+        }
+        self.record_signature(id, "refund_approval_tx", &outcome.tx_hash).await;
+        tracing::info!(order = id, tx = %outcome.tx_hash, refund = %txid, "approved refund");
+        Ok(Some(json!({ "order": id, "decision": "approved refund", "tx": outcome.tx_hash })))
+    }
+
+    /// One refund per order. A different refund may be signed only once the earlier one can
+    /// no longer be mined (unmined and past its expiry height); otherwise both could land.
+    async fn may_sign_refund(&self, order_id: &str, txid: &str) -> Result<(), String> {
+        let prev: Option<(Option<String>, Option<u32>)> = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT refund_tx, refund_expiry FROM orders WHERE id = ?1", [order_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?
+        };
+        let Some((Some(prev), expiry)) = prev else { return Ok(()) };
+        if prev == txid {
+            return Ok(());
+        }
+        let w = self.wallet.lock().await;
+        let mined = w.tx_mined_height(&prev).map_err(|e| e.to_string())?;
+        let tip = w.heights().map_err(|e| e.to_string())?.1.unwrap_or(0);
+        match (mined, expiry) {
+            (None, Some(e)) if e > 0 && tip > e => Ok(()),
+            (Some(h), _) => Err(format!("refund {prev} for this order was already mined at height {h}")),
+            _ => Err(format!("already signed refund {prev} for this order; it can still be mined")),
+        }
+    }
+
+    /// Round 1 of a refund signing round. Every check uses this operator's own data: its
+    /// stored proposal (refund address), its own wallet (what arrived, and when), and the
+    /// vault (the order is still open). Only then does it commit nonces.
+    async fn round1(&self, req: Round1Request) -> Result<Round1Response, (StatusCode, String)> {
+        let refuse = |m: String| (StatusCode::UNPROCESSABLE_ENTITY, m);
+        let share = self.frost.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "this operator has no FROST share configured".to_string()))?;
+        let stored: Option<String> = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT proposal FROM orders WHERE id = ?1", [&req.order_id], |r| r.get(0)).optional().map_err(internal)?
+        };
+        let proposal = stored.ok_or_else(|| refuse(format!("unknown order {}", req.order_id)))?;
+        let proposal: Proposal = serde_json::from_str(&proposal).map_err(internal)?;
+        let refund_address = proposal.refund_address.clone().ok_or_else(|| refuse("order has no refund address".into()))?;
+        let order = self.vault.order(&req.order_id).await.map_err(internal)?.ok_or_else(|| refuse("order is not on the vault".into()))?;
+        if order.state != "open" {
+            return Err(refuse(format!("order is {} on the vault, not open", order.state)));
+        }
+        let received = match self.deposit_status(&proposal).await.map_err(internal)? {
+            DepositStatus::Late { received_zat } => received_zat,
+            DepositStatus::Underpaid { received_zat } if now_ns() > proposal.terms.deposit_deadline => received_zat,
+            other => return Err(refuse(format!("deposit does not call for a refund ({other:?})"))),
+        };
+
+        let pczt = base64::engine::general_purpose::STANDARD.decode(&req.pczt).map_err(bad_request)?;
+        let request = ssl_sign::prepare(&pczt).map_err(bad_request)?;
+        let txid = txid_from_sighash(&request.sighash).unwrap_or_default();
+        self.may_sign_refund(&req.order_id, &txid).await.map_err(refuse)?;
+        let checked = {
+            let w = self.wallet.lock().await;
+            let tip = w.heights().map_err(internal)?.0.unwrap_or(0);
+            let expiry = request.effects.expiry_height;
+            if expiry == 0 || expiry > tip + MAX_REFUND_EXPIRY_BLOCKS {
+                return Err(refuse(format!("refund expiry height {expiry} is not within {MAX_REFUND_EXPIRY_BLOCKS} blocks of {tip}")));
+            }
+            let receiver = w.orchard_receiver(&refund_address).map_err(internal)?;
+            check_refund(&refund_tx(&request.effects), &receiver, received, self.max_refund_fee_zat, |a| w.is_treasury(a))
+        };
+        let refunded = checked.map_err(|r| {
+            tracing::warn!(order = %req.order_id, rejection = %r, "refused to sign refund");
+            refuse(r.to_string())
+        })?;
+
+        let sighash = hex::decode(&request.sighash).map_err(internal)?;
+        let mut spends = vec![];
+        let mut commitments = vec![];
+        for s in &request.spends {
+            let alpha: [u8; 32] = hex::decode(&s.alpha).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| bad_request("bad alpha"))?;
+            let (nonces, c) = share.commit();
+            commitments.push(SpendCommitment { pool: s.pool, index: s.index, commitments: c });
+            spends.push((s.pool, s.index, alpha, nonces));
+        }
+        let mut rounds = self.rounds.lock().await;
+        rounds.retain(|_, r| r.opened.elapsed() < ROUND_TTL);
+        rounds.insert(
+            req.round_id.clone(),
+            OpenRound { order_id: req.order_id.clone(), sighash, expiry_height: request.effects.expiry_height, spends, opened: std::time::Instant::now() },
+        );
+        tracing::info!(order = %req.order_id, round = %req.round_id, refunded, "committed to refund round");
+        Ok(Round1Response { identifier: share.identifier_hex(), sighash: request.sighash, commitments })
+    }
+
+    /// Round 2: signs each spend's package, checking its message is the sighash this
+    /// operator computed and using the alpha it derived. Nonces are consumed either way.
+    async fn round2(&self, req: Round2Request) -> Result<Round2Response, (StatusCode, String)> {
+        let share = self.frost.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "no FROST share".to_string()))?;
+        let round = self.rounds.lock().await.remove(&req.round_id).ok_or_else(|| bad_request("unknown or expired round"))?;
+        if round.opened.elapsed() >= ROUND_TTL {
+            return Err(bad_request("round expired"));
+        }
+        let txid = txid_from_sighash(&hex::encode(&round.sighash)).unwrap_or_default();
+        // Decide and record under one lock: once shares leave, this is the order's refund.
+        let _signing = self.signing.lock().await;
+        self.may_sign_refund(&round.order_id, &txid).await.map_err(|m| (StatusCode::UNPROCESSABLE_ENTITY, m))?;
+        let mut shares = vec![];
+        for (pool, index, alpha, nonces) in round.spends {
+            let pkg = req
+                .packages
+                .iter()
+                .find(|p| p.pool == pool && p.index == index)
+                .ok_or_else(|| bad_request(format!("no signing package for {pool:?} action {index}")))?;
+            let s = share.sign(&pkg.signing_package, nonces, &round.sighash, &alpha).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+            shares.push(SpendShare { pool, index, share: s });
+        }
+        {
+            let db = self.db.lock().await;
+            db.execute("UPDATE orders SET refund_tx = ?1, refund_expiry = ?2 WHERE id = ?3", params![txid, round.expiry_height, round.order_id]).map_err(internal)?;
+        }
+        self.status.lock().await.last_signature_at = Some(now_ns());
+        tracing::info!(order = %round.order_id, refund_tx = %txid, "signed refund");
+        Ok(Round2Response { identifier: share.identifier_hex(), shares })
     }
 
     async fn deposit_status(&self, p: &Proposal) -> Result<DepositStatus> {
@@ -238,7 +425,7 @@ impl Node {
         // Counted from the database so the figure survives restarts.
         let signatures: i64 = {
             let db = self.db.lock().await;
-            db.query_row("SELECT COUNT(approved_tx) + COUNT(release_tx) FROM orders", [], |r| r.get(0)).unwrap_or(0)
+            db.query_row("SELECT COUNT(approved_tx) + COUNT(release_tx) + COUNT(refund_tx) + COUNT(refund_approval_tx) FROM orders", [], |r| r.get(0)).unwrap_or(0)
         };
         let s = self.status.lock().await;
         let fresh = s.last_sync_ok.is_some_and(|t| now_ns().saturating_sub(t) < 120_000_000_000);
@@ -249,6 +436,7 @@ impl Node {
             "bondUsd": bond,
             "signaturesTotal": signatures,
             "lastSignatureAt": s.last_signature_at.map(ns_to_rfc3339),
+            "frost": self.frost.as_ref().map(|f| f.identifier_hex()),
             "walletTip": tip,
             "walletScanned": scanned,
             "lastError": s.last_error,
@@ -298,6 +486,30 @@ fn err_json((code, msg): (StatusCode, String)) -> Response {
 }
 
 type App = Arc<Node>;
+
+async fn round1(State(n): State<App>, headers: HeaderMap, Json(r): Json<Round1Request>) -> Response {
+    if !n.authorized(&headers) {
+        return err_json((StatusCode::UNAUTHORIZED, "missing or wrong bearer token".into()));
+    }
+    // Check against the freshest view of the treasury.
+    if let Err(e) = n.wallet.lock().await.sync().await {
+        tracing::warn!(error = %e, "sync before round 1");
+    }
+    match n.round1(r).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_json(e),
+    }
+}
+
+async fn round2(State(n): State<App>, headers: HeaderMap, Json(r): Json<Round2Request>) -> Response {
+    if !n.authorized(&headers) {
+        return err_json((StatusCode::UNAUTHORIZED, "missing or wrong bearer token".into()));
+    }
+    match n.round2(r).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_json(e),
+    }
+}
 
 async fn health(State(n): State<App>) -> Json<Value> {
     Json(n.health().await)
@@ -388,6 +600,16 @@ async fn main() -> Result<()> {
         min_diversifier_index: 1_000,
     };
 
+    let frost = match (std::env::var("FROST_KEY_PACKAGE").ok().filter(|v| !v.is_empty()), std::env::var("FROST_CONFIG").ok().filter(|v| !v.is_empty())) {
+        (Some(kp), _) => Some(Share::from_hex(&kp, &config::req("FROST_PUBLIC_KEY_PACKAGE")?)?),
+        (None, Some(path)) => Some(Share::from_frost_client_config(path.as_ref(), &config::req("FROST_GROUP_KEY")?)?),
+        (None, None) => None,
+    };
+    match &frost {
+        Some(f) => tracing::info!(identifier = %f.identifier_hex(), group = %f.group_key_hex(), "FROST share loaded"),
+        None => tracing::warn!("no FROST share configured; this operator cannot sign refunds"),
+    }
+
     let node = Arc::new(Node {
         signer,
         vault,
@@ -399,6 +621,10 @@ async fn main() -> Result<()> {
         token,
         status: Mutex::new(Status::default()),
         bond_cache: Mutex::new(None),
+        frost,
+        rounds: Mutex::new(HashMap::new()),
+        signing: Mutex::new(()),
+        max_refund_fee_zat: config::num("MAX_REFUND_FEE_ZAT", 20_000)?,
     });
     tracing::info!(account = %node.signer.account_id, vault = %node.vault.contract, %listen, "operator starting");
 
@@ -415,6 +641,8 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/proposals", post(proposals))
         .route("/v1/releases", post(releases))
+        .route("/v1/signing/round1", post(round1))
+        .route("/v1/signing/round2", post(round2))
         .route("/v1/orders", get(orders))
         .with_state(node);
     let listener = tokio::net::TcpListener::bind(listen).await?;

@@ -381,6 +381,7 @@ export async function orderDetail(id: string): Promise<OrderDetail> {
           state: onChain.state,
           approvers: onChain.approvers,
           releaseApprovals: onChain.release_approvals,
+          refundApprovals: onChain.refund_approvals,
           releaseDeadline: onChain.release_deadline !== "0" ? nsToIso(onChain.release_deadline) : null,
         }
       : null,

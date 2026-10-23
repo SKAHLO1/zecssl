@@ -199,6 +199,14 @@ One contract, `ssl.<org>.testnet`, in `near-sdk` (Rust).
 
 **Exit:** each row is an automated test in the harness, and the core rows also pass on testnet.
 
+> **Status (2026-10-23): FROST-signed refunds run on testnet.** See [protocol/README.md](../protocol/README.md).
+> - **Underpaid:** `zs-5` got 0.001 of 0.002 ZEC. After the deadline the coordinator ran a 2-of-3 rerandomized FROST round (op2 + op3) and broadcast shielded refund `3627ea90…` (0.0009 ZEC) about 15 s later. The user wallet received it, and the vault marked the order refunded once both signers saw it at depth.
+> - **Late:** `zs-6` was paid in full after its deadline and refunded 0.0019 ZEC in `511cf177…`; the vault marked it refunded.
+> - **Malicious coordinator** (`ssl-node/examples/bad_refund.rs`): proven refunds that paid a stranger, skimmed half, or overpaid were all refused by an operator's `check_refund`. An operator that had already signed the real refund refused them at the one-refund-per-order guard.
+> - **Crash between rounds** (`ssl-node/examples/abandoned_round.rs`): `zs-7` was left with nonces committed and no round 2. Operators hold nonces only in memory, for at most 10 minutes. Once the abandoned refund is signed, they refuse any different refund for the order until it expires unmined, so two refunds can never both be mined. The cost is liveness: a replacement waits up to 100 blocks.
+> - **Not yet run:** fewer than t online for refunds, missed release deadline → dispute, equivocation on testnet (contract-tested only), and the regtest reorg harness.
+> - **Known gap:** only the operators that signed a refund approve it on the vault. If a signer goes offline before approving, the refund needs the other signer plus one that can recognise the payment (Phase 8: read the outgoing output with the treasury's OVK).
+
 ### Phase 7 — Direction 2: USDC → shielded ZEC
 
 User locks USDC with `lock_for_zec`, naming a shielded address. The coordinator builds the payout PCZT with the order ID in the memo, and operators verify and sign 2-of-3. Operators then post `claim_settlement`, which opens the challenge window. With no challenge, the USDC moves to liquidity. If challenged, operators must produce a payment disclosure or the user is refunded from bonds.

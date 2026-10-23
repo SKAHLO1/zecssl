@@ -59,6 +59,11 @@ impl Vault {
         self.near.call(signer, &self.contract, "approve_order", json!({ "order_id": id, "terms": terms }), 50 * TGAS, 0).await
     }
 
+    /// Approves that the order's deposit was refunded on Zcash; releases its reservation.
+    pub async fn approve_refund(&self, signer: &Signer, id: &str) -> Result<Outcome> {
+        self.near.call(signer, &self.contract, "approve_refund", json!({ "order_id": id }), 50 * TGAS, 0).await
+    }
+
     /// Release triggers a token transfer and its callback, so it needs more gas.
     pub async fn approve_release(&self, signer: &Signer, id: &str) -> Result<Outcome> {
         self.near.call(signer, &self.contract, "approve_release", json!({ "order_id": id }), 100 * TGAS, 0).await

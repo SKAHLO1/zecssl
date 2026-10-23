@@ -47,7 +47,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 function Timeline({ events, state }: { events: NetworkEvent[]; state: string }) {
   const at = (re: RegExp) => events.find((e) => re.test(e.title))?.at ?? null;
   const reached = milestones.map((m) => ({ ...m, at: at(m.match) }));
-  const failed = state === "refunded" || state === "expired" || state === "disputed";
+  const failed = state === "refunding" || state === "refunded" || state === "expired" || state === "disputed";
   return (
     <ol className="relative space-y-5 border-l border-line pl-6">
       {reached.map((m, i) => {
@@ -76,7 +76,8 @@ function Timeline({ events, state }: { events: NetworkEvent[]; state: string }) 
       {failed && (
         <li className="relative">
           <span className="absolute -left-[31px] grid size-4 place-items-center rounded-full border-2 border-warn bg-warn" />
-          <div className="text-sm font-semibold text-warn">Order {state}</div>
+          <div className="text-sm font-semibold text-warn">{state === "refunding" ? "Refunding the deposit" : `Order ${state}`}</div>
+          {state === "refunding" && <div className="text-xs text-ink-3">The deposit was short or arrived after the deadline, so it goes back to your refund address.</div>}
         </li>
       )}
     </ol>
@@ -177,7 +178,7 @@ export default function OrderPage() {
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="space-y-6">
           <Card title="Deposit">
             {awaiting && order.depositAddress && uri ? (
@@ -235,6 +236,15 @@ export default function OrderPage() {
                 ))}
               </div>
             )}
+            {order.refundTxid && (
+              <div className="mt-4 border-t border-line pt-3 text-sm">
+                <div className="text-xs text-ink-3">Refund transaction (shielded)</div>
+                <a href={explorer.zcashTx(net, order.refundTxid)} target="_blank" rel="noreferrer" className="mt-1 flex items-center gap-1.5 text-forest hover:underline">
+                  <Mono>{`${order.refundTxid.slice(0, 16)}…${order.refundTxid.slice(-8)}`}</Mono>
+                  <ExternalLink className="size-3" />
+                </a>
+              </div>
+            )}
           </Card>
 
           <Card title="Event log">
@@ -244,9 +254,10 @@ export default function OrderPage() {
               <ul className="divide-y divide-line">
                 {order.events.map((e) => (
                   <li key={e.id} className="flex items-start justify-between gap-4 py-2.5 text-sm">
-                    <span>
+                    <span className="min-w-0">
                       <span className="font-medium">{e.title}</span>
-                      <span className="block text-xs text-ink-3">{e.detail}</span>
+                      {/* Details can carry a 64-character txid; let it wrap. */}
+                      <span className="block text-xs text-ink-3 [overflow-wrap:anywhere]">{e.detail}</span>
                     </span>
                     <span className="tnum shrink-0 text-xs text-ink-3">{new Date(e.at).toLocaleTimeString()}</span>
                   </li>
@@ -264,7 +275,11 @@ export default function OrderPage() {
             {order.vault ? (
               <div className="space-y-5">
                 <Approvals title="Opened by" accounts={order.vault.approvers} threshold={order.threshold} net={net} />
-                <Approvals title="Released by" accounts={order.vault.releaseApprovals} threshold={order.threshold} net={net} />
+                {order.vault.refundApprovals.length > 0 || order.state === "refunding" || order.state === "refunded" ? (
+                  <Approvals title="Refund confirmed by" accounts={order.vault.refundApprovals} threshold={order.threshold} net={net} />
+                ) : (
+                  <Approvals title="Released by" accounts={order.vault.releaseApprovals} threshold={order.threshold} net={net} />
+                )}
                 <a href={explorer.nearAccount(net, order.vault.contract)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-xs text-forest hover:underline">
                   Vault contract {order.vault.contract} <ExternalLink className="size-3" />
                 </a>

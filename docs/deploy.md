@@ -51,12 +51,20 @@ You need:
    | `TREASURY_UFVK` | group | the treasury viewing key |
    | `WALLET_BIRTHDAY` | group | e.g. `4524400` |
    | `NEAR_ACCOUNT_ID`, `NEAR_SECRET_KEY` | each `zec-ssl-operator-N` | that operator's account and `ed25519:…` key |
+   | `FROST_KEY_PACKAGE`, `FROST_PUBLIC_KEY_PACKAGE` | each `zec-ssl-operator-N` | that operator's FROST share, from `export_share` (below) |
+   | `FROST_PUBLIC_KEY_PACKAGE` | `zec-ssl-coordinator` | the same public key package; lets the coordinator run refund rounds |
    | `OPERATOR_1_NAME` … `OPERATOR_3_NAME` | `zec-ssl-api` | each operator's NEAR account, in the same order |
    | `CORS_ORIGINS` | `zec-ssl-api` | your Vercel URL, e.g. `https://zec-ssl.vercel.app` (fill in after step 2) |
    | `NEAR_FAUCET_ACCOUNT`, `NEAR_FAUCET_KEY` | `zec-ssl-api` | optional faucet signer; leave empty to disable |
    | `COINGECKO_API_KEY` | `zec-ssl-api` | optional; raises CoinGecko's rate limit |
 
    Service addresses (`COORDINATOR_URL`, `OPERATOR_N_URL`) and the shared `OPERATOR_API_TOKEN` are filled in by Render.
+
+   To print an operator's FROST values from its frost-client config (run where the share lives, and paste `FROST_KEY_PACKAGE` only into that operator's secret):
+
+   ```bash
+   cd protocol && cargo run -q -p ssl-frost --example export_share -- ~/zec-ssl-spike/operators/op1.toml "$(cat ~/zec-ssl-spike/group.key)"
+   ```
 4. Apply. The first Rust image build takes a while, because it compiles the Zcash and FROST libraries. Later builds reuse Render's build cache.
 5. Check `https://<zec-ssl-api>.onrender.com/v1/health`. All sources should report `ok`. The coordinator and operators need a minute after their first start to import the viewing key and sync.
 
@@ -89,4 +97,4 @@ Everything defaults to FastNEAR's public testnet RPC, which rate-limits (HTTP 42
 - **Never run more than one instance** of the coordinator or of any operator; each has its own disk.
 - **Disks are the operators' memory.** An operator that loses its disk forgets which orders it approved. Its wallet rebuilds from the chain, but it won't release orders it approved before the loss. Restore from Render's snapshot.
 - **This is not yet independent operation.** All three operators in one Render account is fine for testnet; independent operators on separate infrastructure is plan Phase 8.
-- **The FROST key shares are not deployed.** Direction-1 settlement doesn't need them; refunds (Phase 6) will.
+- **Each operator's FROST share is a secret of that operator alone.** Without shares, orders still settle, but underpaid or late deposits can't be refunded. On testnet the three shares sit in one Render account; Phase 8 moves them to separate operators.

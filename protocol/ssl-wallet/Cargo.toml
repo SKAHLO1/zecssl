@@ -18,11 +18,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["sync"] }
 tonic = { version = "0.14", features = ["tls-webpki-roots"] }
 tracing = "0.1"
-zcash_client_backend = { version = "=0.25.0-pre.2", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "sync"] }
-zcash_client_sqlite = { version = "=0.23.0-pre.2", features = ["orchard"] }
+zcash_client_backend = { version = "=0.25.0-pre.2", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "sync"] }
+# `pczt` on the backend turns on transparent-inputs there, so the sqlite crate must match.
+zcash_client_sqlite = { version = "=0.23.0-pre.2", features = ["orchard", "serde", "transparent-inputs"] }
 zcash_keys = { version = "=0.17.0-pre.2", features = ["orchard"] }
 zcash_protocol.workspace = true
 zip32 = "0.3"
+zip321 = "=0.10.0-pre.2"
+zcash_address = "=0.14.0-pre.2"
+zcash_primitives.workspace = true
+pczt = { workspace = true, features = ["prover"] }
+orchard = { workspace = true, features = ["circuit"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

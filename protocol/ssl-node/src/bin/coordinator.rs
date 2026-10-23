@@ -5,6 +5,10 @@
 //! The vault contract is the source of truth for order state; the coordinator adds what
 //! only it sees (deposits as they arrive) and serves the API the ZEC SSL website uses.
 //!
+//! Underpaid or late deposits are refunded on Zcash: the coordinator builds and proves the
+//! refund, then runs a two-round rerandomized FROST signing round with a threshold of
+//! operators, each of which checks the transaction for itself before signing.
+//!
 //! Configuration (environment):
 //!   COORDINATOR_LISTEN       127.0.0.1:7000 (or 0.0.0.0:$PORT when PORT is set)
 //!   OPERATORS                name=url pairs, comma separated; or OPERATOR_1_URL /
@@ -23,7 +27,12 @@
 //!   MAX_ORDER_USDC           1000
 //!   MIN_ORDER_ZEC            0.001
 //!   SYNC_INTERVAL_SECS       20
+//!   FROST_PUBLIC_KEY_PACKAGE the treasury's FROST public key package (hex), or
+//!   FROST_CONFIG + FROST_GROUP_KEY   any participant's frost-client config and the group
+//!                            (optional: without it the coordinator cannot run refunds)
+//!   REFUND_FEE_ZAT           10000, kept back from each refund for the network fee
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +49,8 @@ use axum::{Json, Router};
 use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use base64::Engine as _;
+use ssl_node::signing::{txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendPackage};
 use ssl_node::vault::{Vault, VaultConfig};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, VERSION};
 use ssl_policy::{deposit_status, valid_near_account, DepositStatus, OrderTerms, Proposal, SeenDeposit};
@@ -78,7 +89,12 @@ struct Coordinator {
     max_amount_out: u128,
     min_zec_zat: u64,
     last_sync: Mutex<(Option<u64>, Option<String>)>,
+    frost: Option<ssl_frost::Coordinator>,
+    refund_fee_zat: u64,
 }
+
+/// How long to wait before trying a failed refund again.
+const REFUND_RETRY: Duration = Duration::from_secs(120);
 
 fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(path)?;
@@ -128,6 +144,34 @@ fn open_db(path: &PathBuf) -> Result<rusqlite::Connection> {
              CREATE INDEX IF NOT EXISTS events_order ON events (order_id);",
         )?;
     }
+    // v3: refunds and their signing rounds. A round keeps its proven PCZT so a retry signs
+    // the same transaction: operators sign only one refund per order.
+    let has_refund: bool = conn.prepare("SELECT 1 FROM pragma_table_info('orders') WHERE name = 'refund_tx'")?.exists([])?;
+    if !has_refund {
+        conn.execute_batch(
+            "ALTER TABLE orders ADD COLUMN refund_tx TEXT;
+             ALTER TABLE orders ADD COLUMN refund_expiry INTEGER;
+             ALTER TABLE orders ADD COLUMN refund_attempt_ns INTEGER;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS signing_rounds (
+            id TEXT PRIMARY KEY,
+            order_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            signers TEXT NOT NULL DEFAULT '',
+            collected INTEGER NOT NULL DEFAULT 0,
+            sighash TEXT,
+            txid TEXT,
+            expiry INTEGER,
+            pczt TEXT,
+            error TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS signing_rounds_order ON signing_rounds (order_id);",
+    )?;
     Ok(conn)
 }
 
@@ -161,8 +205,8 @@ fn valid_refund_address(network_test: bool, a: &str) -> bool {
 /// The website's order states (server/src/types.ts).
 fn public_state(state: &str) -> &str {
     match state {
-        "awaiting_deposit" | "deposit_detected" | "confirming" | "signing" | "released" | "refunded" | "expired" | "disputed" | "compensated" => state,
-        "needs_refund" => "confirming",
+        "awaiting_deposit" | "deposit_detected" | "confirming" | "signing" | "refunding" | "released" | "refunded" | "expired" | "disputed" | "compensated" => state,
+        "needs_refund" => "refunding",
         _ => "quoted",
     }
 }
@@ -191,13 +235,17 @@ impl Coordinator {
     }
 
     async fn call_operator(&self, op: &Operator, path: &str, body: &Value) -> Result<Value, String> {
+        // An approval waits for one NEAR transaction to be final, a few seconds.
+        self.call_operator_within(op, path, body, Duration::from_secs(30)).await
+    }
+
+    async fn call_operator_within(&self, op: &Operator, path: &str, body: &Value, timeout: Duration) -> Result<Value, String> {
         let res = self
             .http
             .post(format!("{}{path}", op.url))
             .bearer_auth(&self.token)
             .json(body)
-            // An approval waits for one NEAR transaction to be final, a few seconds.
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| format!("{}: unreachable ({e})", op.name))?;
@@ -262,6 +310,7 @@ impl Coordinator {
             diversifier_index: index,
             deposit_address: address.clone(),
             quoted_zec_usd: zec_usd,
+            refund_address: Some(req.refund_address.clone()),
         };
         let body = serde_json::to_value(&proposal).map_err(internal)?;
         // Return as soon as the threshold has approved: an operator that is down or hung
@@ -325,7 +374,7 @@ impl Coordinator {
             let db = self.db.lock().await;
             let mut stmt = match db.prepare(
                 "SELECT id, address, zec_zat, deadline_ns, state FROM orders
-                 WHERE state IN ('awaiting_deposit', 'deposit_detected', 'confirming', 'signing', 'needs_refund')",
+                 WHERE state IN ('awaiting_deposit', 'deposit_detected', 'confirming', 'signing', 'needs_refund', 'refunding')",
             ) {
                 Ok(s) => s,
                 Err(e) => return tracing::error!(error = %e, "listing orders"),
@@ -364,6 +413,9 @@ impl Coordinator {
                 self.event(id, if final_state == "released" { "release" } else { "order" }, &title, &format!("vault state: {final_state}")).await;
             }
             return Ok(());
+        }
+        if state == "refunding" {
+            return self.watch_refund(id).await;
         }
 
         let (deposits, tip) = {
@@ -410,6 +462,11 @@ impl Coordinator {
             };
             self.event(id, kind, &title, &format!("{} of {} ZEC received", format_units(received as u128, 8), format_units(zec_zat as u128, 8))).await;
         }
+        if next == "needs_refund" {
+            if let DepositStatus::Underpaid { received_zat } | DepositStatus::Late { received_zat } = status {
+                self.try_refund(id, received_zat).await;
+            }
+        }
         if matches!(status, DepositStatus::Paid { .. }) {
             // Each operator decides for itself; this only asks them to look now.
             let body = json!({ "order_id": id });
@@ -422,9 +479,203 @@ impl Coordinator {
         Ok(())
     }
 
+    /// A broadcast refund that is never mined expires; the order then goes back to
+    /// needs_refund and the operators may sign a replacement.
+    async fn watch_refund(&self, id: &str) -> Result<()> {
+        let (txid, expiry): (Option<String>, Option<u32>) = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT refund_tx, refund_expiry FROM orders WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        };
+        let Some(txid) = txid else { return Ok(()) };
+        let (mined, tip) = {
+            let w = self.wallet.lock().await;
+            (w.tx_mined_height(&txid)?, w.heights()?.1.unwrap_or(0))
+        };
+        if mined.is_none() && expiry.is_some_and(|e| e > 0 && tip > e) && self.set_state(id, "needs_refund").await? {
+            self.event(id, "refund", &format!("Refund for {id} expired unmined"), &format!("{txid} was not mined by block {}; trying again", expiry.unwrap_or(0))).await;
+        }
+        Ok(())
+    }
+
+    /// Refunds an order's deposit, minus the network fee allowance, to the refund address
+    /// the operators approved. Failures are recorded and retried after `REFUND_RETRY`.
+    async fn try_refund(&self, id: &str, received_zat: u64) {
+        let Some(frost) = &self.frost else { return };
+        let row: Option<(String, Option<i64>)> = {
+            let db = self.db.lock().await;
+            db.query_row("SELECT refund_address, refund_attempt_ns FROM orders WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).ok()
+        };
+        let Some((refund_address, last_attempt)) = row else { return };
+        if last_attempt.is_some_and(|t| now_ns().saturating_sub(t as u64) < REFUND_RETRY.as_nanos() as u64) {
+            return;
+        }
+        {
+            let db = self.db.lock().await;
+            let _ = db.execute("UPDATE orders SET refund_attempt_ns = ?1 WHERE id = ?2", params![now_ns() as i64, id]);
+        }
+        if received_zat <= self.refund_fee_zat {
+            return tracing::warn!(order = id, received_zat, "deposit is too small to refund");
+        }
+        let round_id = format!("rf-{id}-{:08x}", random_u64() as u32);
+        {
+            let db = self.db.lock().await;
+            let _ = db.execute(
+                "INSERT INTO signing_rounds (id, order_id, kind, state, started_ns) VALUES (?1, ?2, 'refund', 'open', ?3)",
+                params![round_id, id, now_ns() as i64],
+            );
+        }
+        match self.refund(frost, id, &round_id, &refund_address, received_zat - self.refund_fee_zat).await {
+            Ok(txid) => {
+                tracing::info!(order = id, round = %round_id, %txid, "refund broadcast");
+                self.finish_round(&round_id, "complete", None).await;
+                self.set_state(id, "refunding").await.ok();
+                self.event(
+                    id,
+                    "refund",
+                    &format!("Refund sent for {id}"),
+                    &format!("{} ZEC back to the refund address in {txid}", format_units((received_zat - self.refund_fee_zat) as u128, 8)),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(order = id, round = %round_id, error = %e, "refund round failed");
+                self.finish_round(&round_id, "failed", Some(&e.to_string())).await;
+                self.event(id, "signing", &format!("Refund round for {id} failed"), &e.to_string()).await;
+            }
+        }
+    }
+
+    async fn finish_round(&self, round_id: &str, state: &str, error: Option<&str>) {
+        let db = self.db.lock().await;
+        if let Err(e) = db.execute(
+            "UPDATE signing_rounds SET state = ?1, error = ?2, finished_ns = ?3 WHERE id = ?4",
+            params![state, error, now_ns() as i64, round_id],
+        ) {
+            tracing::error!(error = %e, "recording a signing round");
+        }
+    }
+
+    /// One refund signing round. Returns the broadcast txid.
+    async fn refund(&self, frost: &ssl_frost::Coordinator, id: &str, round_id: &str, to: &str, value_zat: u64) -> Result<String> {
+        // Reuse the transaction of an earlier attempt while it can still be mined: an
+        // operator that already signed it will not sign a different one.
+        let tip = self.wallet.lock().await.heights()?.1.unwrap_or(0);
+        let earlier: Option<String> = {
+            let db = self.db.lock().await;
+            db.query_row(
+                "SELECT pczt FROM signing_rounds WHERE order_id = ?1 AND pczt IS NOT NULL AND expiry > ?2 ORDER BY started_ns DESC LIMIT 1",
+                params![id, tip + 3],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        let proved = match earlier {
+            Some(b64) => base64::engine::general_purpose::STANDARD.decode(b64)?,
+            None => {
+                let pczt = self.wallet.lock().await.create_payment(to, value_zat, &format!("zec-ssl refund {id}"))?;
+                // Proving takes seconds of CPU and needs no wallet.
+                tokio::task::spawn_blocking(move || ssl_wallet::prove(&pczt)).await??
+            }
+        };
+        let request = ssl_sign::prepare(&proved)?;
+        anyhow::ensure!(request.effects.is_fully_shielded(), "refund is not fully shielded");
+        let txid = txid_from_sighash(&request.sighash).ok_or_else(|| anyhow!("bad sighash"))?;
+        let pczt_b64 = base64::engine::general_purpose::STANDARD.encode(&proved);
+        {
+            let db = self.db.lock().await;
+            db.execute(
+                "UPDATE signing_rounds SET sighash = ?1, txid = ?2, expiry = ?3, pczt = ?4 WHERE id = ?5",
+                params![request.sighash, txid, request.effects.expiry_height, pczt_b64, round_id],
+            )?;
+        }
+
+        // Round 1: every operator checks the transaction; the first threshold to commit sign.
+        let threshold = self.vault_config.threshold as usize;
+        let body = serde_json::to_value(Round1Request { round_id: round_id.into(), kind: RoundKind::Refund, order_id: id.into(), pczt: pczt_b64 })?;
+        let timeout = Duration::from_secs(90);
+        let body = &body;
+        let mut pending: FuturesUnordered<_> = self
+            .operators
+            .iter()
+            .map(|op| async move { (op, self.call_operator_within(op, "/v1/signing/round1", &body, timeout).await) })
+            .collect();
+        let (mut chosen, mut reasons): (Vec<(&Operator, Round1Response)>, Vec<String>) = (vec![], vec![]);
+        while let Some((op, result)) = pending.next().await {
+            match result.and_then(|v| serde_json::from_value::<Round1Response>(v).map_err(|e| format!("{}: {e}", op.name))) {
+                Ok(r) if r.sighash == request.sighash => chosen.push((op, r)),
+                Ok(_) => reasons.push(format!("{}: computed a different sighash", op.name)),
+                Err(e) => reasons.push(e),
+            }
+            if chosen.len() >= threshold {
+                break;
+            }
+        }
+        drop(pending);
+        anyhow::ensure!(chosen.len() >= threshold, "{} of {threshold} operators committed: {}", chosen.len(), reasons.join("; "));
+        {
+            let names = chosen.iter().map(|(op, _)| op.name.as_str()).collect::<Vec<_>>().join(",");
+            let db = self.db.lock().await;
+            db.execute("UPDATE signing_rounds SET signers = ?1 WHERE id = ?2", params![names, round_id])?;
+        }
+
+        // Round 2: one signing package per spend, from the chosen operators' commitments.
+        let message = hex::decode(&request.sighash)?;
+        let mut packages = vec![];
+        for spend in &request.spends {
+            let mut commitments = BTreeMap::new();
+            for (op, r) in &chosen {
+                let c = r
+                    .commitments
+                    .iter()
+                    .find(|c| c.pool == spend.pool && c.index == spend.index)
+                    .ok_or_else(|| anyhow!("{} sent no commitment for a spend", op.name))?;
+                commitments.insert(r.identifier.clone(), c.commitments.clone());
+            }
+            packages.push(SpendPackage { pool: spend.pool, index: spend.index, signing_package: frost.signing_package(&commitments, &message)? });
+        }
+        let body = serde_json::to_value(Round2Request { round_id: round_id.into(), packages: packages.clone() })?;
+        let replies = join_all(chosen.iter().map(|(op, _)| self.call_operator_within(op, "/v1/signing/round2", &body, timeout))).await;
+        let mut responses = vec![];
+        for (reply, (op, _)) in replies.into_iter().zip(&chosen) {
+            let r: Round2Response = serde_json::from_value(reply.map_err(|e| anyhow!(e))?).with_context(|| format!("{}: bad round 2 reply", op.name))?;
+            responses.push(r);
+        }
+        {
+            let db = self.db.lock().await;
+            db.execute("UPDATE signing_rounds SET collected = ?1 WHERE id = ?2", params![responses.len() as i64, round_id])?;
+        }
+
+        // Aggregate (which verifies every share), sign, and send.
+        let mut signatures = vec![];
+        for (spend, package) in request.spends.iter().zip(&packages) {
+            let mut shares = BTreeMap::new();
+            for r in &responses {
+                let s = r.shares.iter().find(|s| s.pool == spend.pool && s.index == spend.index).ok_or_else(|| anyhow!("missing a signature share"))?;
+                shares.insert(r.identifier.clone(), s.share.clone());
+            }
+            let alpha: [u8; 32] = hex::decode(&spend.alpha)?.try_into().map_err(|_| anyhow!("bad alpha"))?;
+            let signature = frost.aggregate(&package.signing_package, &shares, &alpha)?;
+            signatures.push(ssl_sign::SpendSignature { pool: spend.pool, index: spend.index, signature });
+        }
+        let signed = ssl_sign::apply(&proved, &signatures)?;
+        let tx = ssl_sign::extract(&signed)?;
+        anyhow::ensure!(tx.transparent_inputs == 0 && tx.transparent_outputs == 0, "extracted refund has transparent parts");
+        anyhow::ensure!(tx.txid == txid, "extracted txid {} differs from the signed sighash", tx.txid);
+        let send = self.wallet.lock().await.broadcast(&tx.raw);
+        send.await?;
+        {
+            let db = self.db.lock().await;
+            db.execute(
+                "UPDATE orders SET refund_tx = ?1, refund_expiry = ?2, updated_ns = ?3 WHERE id = ?4",
+                params![txid, request.effects.expiry_height, now_ns() as i64, id],
+            )?;
+        }
+        Ok(txid)
+    }
+
     async fn order_rows(&self, where_id: Option<&str>, limit: i64) -> Result<Vec<Value>> {
         let db = self.db.lock().await;
-        let sql = "SELECT id, state, zec_zat, amount_out, approvals, release_approvals, created_ns, updated_ns, address, deadline_ns, received_zat, deposit_txids, recipient
+        let sql = "SELECT id, state, zec_zat, amount_out, approvals, release_approvals, created_ns, updated_ns, address, deadline_ns, received_zat, deposit_txids, recipient, refund_tx
                    FROM orders WHERE id IS NOT NULL AND state != 'proposing' AND (?1 IS NULL OR id = ?1) ORDER BY seq DESC LIMIT ?2";
         let mut stmt = db.prepare(sql)?;
         let decimals = self.vault_config.token_decimals;
@@ -451,6 +702,7 @@ impl Coordinator {
                 "receivedZec": format_units(r.get::<_, i64>(10)? as u128, 8),
                 "depositTxids": r.get::<_, Option<String>>(11)?.map(|s| s.split(',').filter(|t| !t.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default(),
                 "recipient": r.get::<_, String>(12)?,
+                "refundTxid": r.get::<_, Option<String>>(13)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -585,9 +837,35 @@ async fn treasury(State(c): State<App>) -> Response {
     }
 }
 
-async fn signing_rounds() -> Json<Value> {
-    // Direction-1 settlement needs no Zcash signatures; FROST rounds arrive with refunds.
-    Json(json!([]))
+async fn signing_rounds(State(c): State<App>, Query(q): Query<Limit>) -> Response {
+    let db = c.db.lock().await;
+    let rows = (|| -> Result<Vec<Value>> {
+        let mut stmt = db.prepare(
+            "SELECT id, order_id, kind, state, signers, collected, started_ns, finished_ns, txid, error
+             FROM signing_rounds ORDER BY started_ns DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([q.limit.unwrap_or(50).clamp(1, 200)], |r| {
+            let signers: String = r.get(4)?;
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "orderId": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "state": r.get::<_, String>(3)?,
+                "signers": signers.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+                "collected": r.get::<_, i64>(5)?,
+                "threshold": c.vault_config.threshold,
+                "startedAt": ns_to_rfc3339(r.get::<_, i64>(6)? as u64),
+                "completedAt": r.get::<_, Option<i64>>(7)?.map(|t| ns_to_rfc3339(t as u64)),
+                "txid": r.get::<_, Option<String>>(8)?,
+                "error": r.get::<_, Option<String>>(9)?,
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })();
+    match rows {
+        Ok(v) => Json(json!(v)).into_response(),
+        Err(e) => err_json(internal(e)),
+    }
 }
 
 async fn health(State(c): State<App>) -> Json<Value> {
@@ -620,6 +898,17 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    let frost = match (std::env::var("FROST_PUBLIC_KEY_PACKAGE").ok().filter(|v| !v.is_empty()), std::env::var("FROST_CONFIG").ok().filter(|v| !v.is_empty())) {
+        (Some(pkg), _) => Some(ssl_frost::Coordinator::from_hex(&pkg)?),
+        (None, Some(path)) => Some(ssl_frost::Coordinator::from_frost_client_config(path.as_ref(), &config::req("FROST_GROUP_KEY")?)?),
+        (None, None) => None,
+    };
+    match &frost {
+        Some(f) => tracing::info!(group = %f.group_key_hex(), "FROST public key package loaded"),
+        None => tracing::warn!("no FROST public key package configured; refunds will not be signed"),
+    }
+    let refund_fee_zat: u64 = config::num("REFUND_FEE_ZAT", 10_000)?;
+
     let decimals = vault_config.token_decimals;
     let coordinator = Arc::new(Coordinator {
         vault,
@@ -636,6 +925,8 @@ async fn main() -> Result<()> {
         min_zec_zat: (config::num::<f64>("MIN_ORDER_ZEC", 0.001)? * 1e8) as u64,
         vault_config,
         last_sync: Mutex::new((None, None)),
+        frost,
+        refund_fee_zat,
     });
     tracing::info!(vault = %coordinator.vault.contract, operators = coordinator.operators.len(), %listen, "coordinator starting");
 
