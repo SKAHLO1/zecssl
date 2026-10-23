@@ -20,7 +20,9 @@ set -euo pipefail
 : "${VAULT:?set VAULT}"
 : "${PREFIX:?set PREFIX}"
 DEPS="${ZEC_SSL_DEPS:-$HOME/zec-ssl-deps}"
+# Fresh builds land in target-protocol/release; $DEPS/bin keeps copies when that is cleaned.
 BIN="${BIN:-$DEPS/target-protocol/release}"
+[ -x "$BIN/ssl-operator" ] || BIN="$DEPS/bin"
 STATE="${STATE:-$HOME/zec-ssl-run}"
 UFVK_FILE="${UFVK_FILE:-$HOME/zec-ssl-spike/ufvk.txt}"
 CREDS="$HOME/.near-credentials/testnet"
