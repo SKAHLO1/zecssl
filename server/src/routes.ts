@@ -4,7 +4,7 @@ import { errorMessage, HttpError } from "./http.js";
 import { fetchChart } from "./sources/coingecko.js";
 import { quote } from "./sources/intents.js";
 import { accountStatus, drip, faucetEnabled, register } from "./sources/faucet.js";
-import { coordinatorQuote, createOrder, orderDetail } from "./sources/network.js";
+import { coordinatorQuote, createOrder, createPayout, orderDetail } from "./sources/network.js";
 import { store } from "./store.js";
 import type { ChartRange, FaucetInfo, NetworkSnapshot, Overview, QuoteRequest, StreamTopic } from "./types.js";
 
@@ -107,6 +107,13 @@ export async function routes(app: FastifyInstance) {
   app.post("/v1/orders", async (req) => {
     if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected, so orders cannot be opened yet.");
     return createOrder(req.body);
+  });
+
+  // Direction 2: quote vault tokens → shielded ZEC. The user then locks the tokens with the
+  // returned ft_transfer_call from their own NEAR wallet.
+  app.post("/v1/payouts", async (req) => {
+    if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected, so payouts cannot be quoted yet.");
+    return createPayout(req.body);
   });
 
   // Server-Sent Events: a snapshot of every topic on connect, then each update as it lands.
