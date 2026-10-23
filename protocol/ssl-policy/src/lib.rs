@@ -86,7 +86,7 @@ impl std::fmt::Display for Rejection {
             Rejection::TooLarge => f.write_str("order is above the maximum"),
             Rejection::DeadlineTooSoon => f.write_str("deposit deadline is too soon"),
             Rejection::DeadlineTooFar => f.write_str("deposit deadline is too far out"),
-            Rejection::Overpays { max_amount_out } => write!(f, "quote pays out more than this operator's price allows (max {max_amount_out})"),
+            Rejection::Overpays { max_amount_out } => write!(f, "order pays out more than this operator's price allows (max {max_amount_out})"),
             Rejection::NoPrice => f.write_str("operator has no current ZEC price"),
             Rejection::IdConflict => f.write_str("this order id already exists on the vault with different terms"),
         }
@@ -226,6 +226,31 @@ pub fn check_refund(
     max_fee_zat: u64,
     is_treasury: impl Fn(&[u8; 43]) -> bool,
 ) -> Result<u64, RefundRejection> {
+    check_spend(tx, refund_receiver, received_zat.saturating_sub(max_fee_zat), received_zat, max_fee_zat, is_treasury)
+}
+
+/// The checks an operator runs before signing a direction-2 payout: like a refund, except
+/// the user must receive exactly the ZEC amount the vault order locked funds for.
+pub fn check_payout(
+    tx: &RefundTx,
+    payout_receiver: &[u8; 43],
+    zec_amount_zat: u64,
+    max_fee_zat: u64,
+    is_treasury: impl Fn(&[u8; 43]) -> bool,
+) -> Result<u64, RefundRejection> {
+    check_spend(tx, payout_receiver, zec_amount_zat, zec_amount_zat, max_fee_zat, is_treasury)
+}
+
+/// A treasury spend that pays `receiver` between `min` and `max` zatoshis, sends anything
+/// else back to the treasury, and burns at most `max_fee_zat`.
+fn check_spend(
+    tx: &RefundTx,
+    receiver: &[u8; 43],
+    min: u64,
+    max: u64,
+    max_fee_zat: u64,
+    is_treasury: impl Fn(&[u8; 43]) -> bool,
+) -> Result<u64, RefundRejection> {
     if tx.transparent_inputs + tx.transparent_outputs + tx.sapling_spends + tx.sapling_outputs > 0 {
         return Err(RefundRejection::NotShielded);
     }
@@ -238,21 +263,46 @@ pub fn check_refund(
         }
         let to = o.recipient.ok_or(RefundRejection::Redacted)?;
         total_out += value;
-        if &to == refund_receiver {
+        if &to == receiver {
             paid += value;
         } else if !is_treasury(&to) {
             return Err(RefundRejection::PaysStranger);
         }
     }
-    let min = received_zat.saturating_sub(max_fee_zat);
-    if paid < min || paid > received_zat || paid == 0 {
-        return Err(RefundRejection::WrongAmount { paid, min, max: received_zat });
+    if paid < min || paid > max || paid == 0 {
+        return Err(RefundRejection::WrongAmount { paid, min, max });
     }
     let fee = spent.saturating_sub(total_out);
     if fee > max_fee_zat {
         return Err(RefundRejection::FeeTooHigh { fee });
     }
     Ok(paid)
+}
+
+/// The most ZEC a direction-2 order may pay for `amount_in` of the vault token, at the
+/// operator's own price after spread, plus tolerance.
+pub fn max_payout_zat(amount_in: u128, own_zec_usd: f64, limits: &Limits) -> u64 {
+    let usd = amount_in as f64 / 10f64.powi(limits.token_decimals as i32);
+    let after_spread = own_zec_usd / (1.0 - limits.spread_bps as f64 / 10_000.0);
+    let floor_price = after_spread / (1.0 + limits.price_tolerance_bps as f64 / 10_000.0);
+    (usd / floor_price * 1e8).floor() as u64
+}
+
+/// The checks an operator runs on a direction-2 order's terms before signing its payout:
+/// the locked amount is within limits and buys at least the ZEC it asks for.
+pub fn check_payout_terms(amount_in: u128, zec_amount_zat: u64, own_zec_usd: Option<f64>, limits: &Limits) -> Result<(), Rejection> {
+    if amount_in > limits.max_amount_out {
+        return Err(Rejection::TooLarge);
+    }
+    if zec_amount_zat < limits.min_zec_zat {
+        return Err(Rejection::TooSmall);
+    }
+    let price = own_zec_usd.ok_or(Rejection::NoPrice)?;
+    let max = max_payout_zat(amount_in, price, limits);
+    if zec_amount_zat > max {
+        return Err(Rejection::Overpays { max_amount_out: max as u128 });
+    }
+    Ok(())
 }
 
 /// A deposit as an operator's wallet reports it.
@@ -456,6 +506,31 @@ mod tests {
         let mut tx = refund_tx(&[(880_000, USER)], 1_000_000);
         tx.outputs[0].recipient = None;
         assert_eq!(check_refund(&tx, &USER, 900_000, 20_000, is_treasury), Err(RefundRejection::Redacted));
+    }
+
+    #[test]
+    fn a_payout_must_pay_exactly_the_locked_amount() {
+        let tx = refund_tx(&[(500_000, USER), (490_000, TREASURY)], 1_000_000);
+        assert_eq!(check_payout(&tx, &USER, 500_000, 20_000, is_treasury), Ok(500_000));
+        // One zatoshi short, or one over, is refused.
+        let tx = refund_tx(&[(499_999, USER), (490_001, TREASURY)], 1_000_000);
+        assert!(matches!(check_payout(&tx, &USER, 500_000, 20_000, is_treasury), Err(RefundRejection::WrongAmount { .. })));
+        let tx = refund_tx(&[(500_001, USER), (489_999, TREASURY)], 1_000_000);
+        assert!(matches!(check_payout(&tx, &USER, 500_000, 20_000, is_treasury), Err(RefundRejection::WrongAmount { .. })));
+        let tx = refund_tx(&[(500_000, STRANGER), (490_000, TREASURY)], 1_000_000);
+        assert!(check_payout(&tx, &USER, 500_000, 20_000, is_treasury).is_err());
+    }
+
+    #[test]
+    fn payout_terms_follow_the_operators_own_price() {
+        let l = limits();
+        // 50 USDC at $50/ZEC, 25 bps spread, 100 bps tolerance: about 1.0075 ZEC at most.
+        let amount_in = 50_000_000u128;
+        let max = max_payout_zat(amount_in, 50.0, &l);
+        assert!((100_500_000..101_000_000).contains(&max), "{max}");
+        assert_eq!(check_payout_terms(amount_in, 99_000_000, Some(50.0), &l), Ok(()));
+        assert!(matches!(check_payout_terms(amount_in, max + 1, Some(50.0), &l), Err(Rejection::Overpays { .. })));
+        assert_eq!(check_payout_terms(amount_in, 99_000_000, None, &l), Err(Rejection::NoPrice));
     }
 
     #[test]
