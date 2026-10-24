@@ -87,7 +87,7 @@ async function pollCoordinator() {
     fetchJson<Order[]>(`${base}/v1/orders?limit=50`, { timeoutMs: 5_000 }),
     fetchJson<SigningRound[]>(`${base}/v1/signing-rounds?limit=50`, { timeoutMs: 5_000 }),
     fetchJson<NetworkEvent[]>(`${base}/v1/events?limit=50`, { timeoutMs: 5_000 }),
-    fetchJson<Pick<TreasuryState, "shieldedBalanceZat" | "addressesIssued" | "lastScanHeight">>(`${base}/v1/treasury`, {
+    fetchJson<Pick<TreasuryState, "shieldedBalanceZat" | "availableForPayoutsZat" | "addressesIssued" | "lastScanHeight">>(`${base}/v1/treasury`, {
       timeoutMs: 5_000,
     }),
   ]);
@@ -304,6 +304,7 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
     treasury: hasTreasury
       ? {
           shieldedBalanceZat: scan?.shieldedBalanceZat ?? null,
+          availableForPayoutsZat: scan?.availableForPayoutsZat ?? null,
           addressesIssued: scan?.addressesIssued ?? null,
           lastScanHeight: scan?.lastScanHeight ?? null,
           vaultLiquidity: contracts?.liquidity ?? [],
