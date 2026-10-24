@@ -2,5 +2,22 @@
 # this machine (a free <ip-with-dashes>.sslip.io name works without buying a domain).
 {$API_DOMAIN} {
 	encode gzip
+
+	# The API only takes small JSON bodies; refuse anything large before it reaches Node.
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		# HTTPS only, for a year; no MIME sniffing; never framed; no referrer leaks.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# The API returns JSON and event streams only: it should never run or load anything.
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
 	reverse_proxy api:4000
 }
