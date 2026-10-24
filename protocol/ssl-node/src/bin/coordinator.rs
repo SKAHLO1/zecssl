@@ -37,7 +37,7 @@
 //!                            (optional: without it the coordinator cannot run refunds)
 //!   REFUND_FEE_ZAT           10000, kept back from each refund for the network fee
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use base64::Engine as _;
-use ssl_node::signing::{txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendPackage};
+use ssl_node::signing::{txid_from_sighash, AttestRequest, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendPackage};
 use ssl_node::vault::VaultOrder;
 use ssl_node::vault::{Vault, VaultConfig};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, VERSION};
@@ -97,7 +97,12 @@ struct Coordinator {
     last_sync: Mutex<(Option<u64>, Option<String>)>,
     frost: Option<ssl_frost::Coordinator>,
     refund_fee_zat: u64,
+    /// When each order's spend was last sent to the operators to attest.
+    attested: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+/// How often a broadcast spend is re-sent to operators that have not settled it yet.
+const REATTEST_EVERY: Duration = Duration::from_secs(300);
 
 /// How long to wait before trying a failed refund again.
 const REFUND_RETRY: Duration = Duration::from_secs(120);
@@ -526,9 +531,13 @@ impl Coordinator {
             let w = self.wallet.lock().await;
             (w.tx_mined_height(&txid)?, w.heights()?.1.unwrap_or(0))
         };
-        if mined.is_none() && expiry.is_some_and(|e| e > 0 && tip > e) && self.set_state(id, "needs_refund").await? {
-            self.event(id, "refund", &format!("Refund for {id} expired unmined"), &format!("{txid} was not mined by block {}; trying again", expiry.unwrap_or(0))).await;
+        if mined.is_none() && expiry.is_some_and(|e| e > 0 && tip > e) {
+            if self.set_state(id, "needs_refund").await? {
+                self.event(id, "refund", &format!("Refund for {id} expired unmined"), &format!("{txid} was not mined by block {}; trying again", expiry.unwrap_or(0))).await;
+            }
+            return Ok(());
         }
+        self.attest_all(RoundKind::Refund, id, false).await;
         Ok(())
     }
 
@@ -565,6 +574,7 @@ impl Coordinator {
                 tracing::info!(order = id, round = %round_id, %txid, "refund broadcast");
                 self.finish_round(&round_id, "complete", None).await;
                 self.set_state(id, "refunding").await.ok();
+                self.attest_all(RoundKind::Refund, id, true).await;
                 self.event(
                     id,
                     "refund",
@@ -637,7 +647,10 @@ impl Coordinator {
             };
             let expired = mined.is_none() && expiry.is_some_and(|e| e > 0 && tip > e);
             if !expired {
-                return Ok(()); // out, or mined: the operators claim from here
+                // Out, or mined: the operators claim from here. Operators that did not sign
+                // get the transaction too, so one signer going offline does not stall it.
+                self.attest_all(RoundKind::Payout, id, false).await;
+                return Ok(());
             }
             self.event(id, "signing", &format!("Payout for {id} expired unmined"), &format!("{txid} was not mined by block {}; paying again", expiry.unwrap_or(0))).await;
         }
@@ -663,6 +676,7 @@ impl Coordinator {
                 tracing::info!(order = id, round = %round_id, %txid, "payout broadcast");
                 self.finish_round(&round_id, "complete", None).await;
                 self.set_state(id, "paid").await?;
+                self.attest_all(RoundKind::Payout, id, true).await;
                 self.event(id, "release", &format!("ZEC sent for {id}"), &format!("{} ZEC to the payout address in {txid}", format_units(value as u128, 8))).await;
             }
             Err(e) => {
@@ -699,8 +713,13 @@ impl Coordinator {
             return Err(bad("amount is below the minimum"));
         }
         let treasury = self.wallet.lock().await.balance_zat().map_err(internal)?;
-        if zec_zat + self.refund_fee_zat > treasury {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "the treasury doesn't hold enough ZEC for this order right now".into()));
+        let available = treasury.saturating_sub(self.reserved_zat().await);
+        if zec_zat + self.refund_fee_zat > available {
+            let most = available.saturating_sub(self.refund_fee_zat);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the treasury can pay at most {} ZEC right now", format_units(most as u128, 8)),
+            ));
         }
 
         let now = now_ns();
@@ -749,6 +768,50 @@ impl Coordinator {
                 "msg": msg.to_string(),
             },
         }))
+    }
+
+    /// Sends an order's broadcast spend to every operator to check and settle, including
+    /// those that did not sign it. Best effort: an operator that refuses or is down is only
+    /// logged. Without `now`, at most once per `REATTEST_EVERY`.
+    async fn attest_all(&self, kind: RoundKind, id: &str, now: bool) {
+        {
+            let mut last = self.attested.lock().await;
+            if !now && last.get(id).is_some_and(|t| t.elapsed() < REATTEST_EVERY) {
+                return;
+            }
+            last.insert(id.to_string(), std::time::Instant::now());
+        }
+        let pczt: Option<String> = {
+            let db = self.db.lock().await;
+            db.query_row(
+                "SELECT r.pczt FROM signing_rounds r JOIN orders o ON o.id = r.order_id
+                 WHERE r.order_id = ?1 AND r.txid = o.refund_tx AND r.pczt IS NOT NULL ORDER BY r.started_ns DESC LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        let Some(pczt) = pczt else { return };
+        let Ok(body) = serde_json::to_value(AttestRequest { kind, order_id: id.into(), pczt }) else { return };
+        let timeout = Duration::from_secs(90);
+        for (op, r) in self.operators.iter().zip(join_all(self.operators.iter().map(|op| self.call_operator_within(op, "/v1/spends/attest", &body, timeout))).await) {
+            if let Err(e) = r {
+                tracing::debug!(order = id, operator = %op.name, error = %e, "attest");
+            }
+        }
+    }
+
+    /// ZEC promised to direction-2 orders that are quoted or locked but not yet paid, plus
+    /// a fee allowance for each. New quotes only spend what is left.
+    async fn reserved_zat(&self) -> u64 {
+        let db = self.db.lock().await;
+        db.query_row(
+            "SELECT COALESCE(SUM(zec_zat + ?1), 0) FROM orders
+             WHERE direction = 'near_to_zec' AND state IN ('awaiting_lock', 'locked', 'paying')",
+            [self.refund_fee_zat as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as u64
     }
 
     async fn finish_round(&self, round_id: &str, state: &str, error: Option<&str>) {
@@ -1082,10 +1145,18 @@ async fn order_events(State(c): State<App>, Path(id): Path<String>) -> Response 
 }
 
 async fn treasury(State(c): State<App>) -> Response {
+    let reserved = c.reserved_zat().await;
     let w = c.wallet.lock().await;
     let issued: i64 = c.db.lock().await.query_row("SELECT COUNT(*) FROM orders WHERE address IS NOT NULL", [], |r| r.get(0)).unwrap_or(0);
     match (w.balance_zat(), w.heights()) {
-        (Ok(bal), Ok((_, scanned))) => Json(json!({ "shieldedBalanceZat": bal.to_string(), "addressesIssued": issued, "lastScanHeight": scanned })).into_response(),
+        (Ok(bal), Ok((_, scanned))) => Json(json!({
+            "shieldedBalanceZat": bal.to_string(),
+            // What a new USDC → ZEC order can still be paid from, after open orders and fees.
+            "availableForPayoutsZat": bal.saturating_sub(reserved).saturating_sub(c.refund_fee_zat).to_string(),
+            "addressesIssued": issued,
+            "lastScanHeight": scanned,
+        }))
+        .into_response(),
         (Err(e), _) | (_, Err(e)) => err_json(internal(e)),
     }
 }
@@ -1180,6 +1251,7 @@ async fn main() -> Result<()> {
         last_sync: Mutex::new((None, None)),
         frost,
         refund_fee_zat,
+        attested: Mutex::new(HashMap::new()),
     });
     tracing::info!(vault = %coordinator.vault.contract, operators = coordinator.operators.len(), %listen, "coordinator starting");
 
