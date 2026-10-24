@@ -6,6 +6,7 @@ dist
 *.tsbuildinfo
 next-env.d.ts
 protocol/target
+protocol/bin
 contracts/res
 contracts/target
 deploy/.env
