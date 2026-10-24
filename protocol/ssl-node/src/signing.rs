@@ -31,6 +31,15 @@ pub struct Round1Request {
     pub pczt: String,
 }
 
+/// After a spend is broadcast: here is its unsigned transaction; check it like round 1
+/// would and, if it passes, settle it on the vault once it is mined.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestRequest {
+    pub kind: RoundKind,
+    pub order_id: String,
+    pub pczt: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpendCommitment {
     pub pool: ssl_sign::Pool,
