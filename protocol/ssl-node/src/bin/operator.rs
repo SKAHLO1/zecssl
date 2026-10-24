@@ -12,6 +12,9 @@
 //!   checking the locked order against its own price and the transaction against the order,
 //!   claims settlement on the vault once its wallet sees the payout mined, and finalizes
 //!   the claim when the challenge window closes;
+//! - settles refunds and payouts it did not sign too: given the unsigned transaction at
+//!   `/v1/spends/attest`, it runs the same checks and, once its wallet sees it mined,
+//!   approves or claims it, so one signer going offline does not stall settlement;
 //! - reports its health at `GET /health`.
 //!
 //! It never trusts the coordinator: a proposal is just a request to check.
@@ -57,7 +60,9 @@ use serde_json::{json, Value};
 use ssl_near::Signer;
 use base64::Engine as _;
 use ssl_frost::{Share, SigningNonces};
-use ssl_node::signing::{refund_tx, txid_from_sighash, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendCommitment, SpendShare};
+use ssl_node::signing::{
+    refund_tx, txid_from_sighash, AttestRequest, Round1Request, Round1Response, Round2Request, Round2Response, RoundKind, SpendCommitment, SpendShare,
+};
 use ssl_node::{config, now_ns, ns_to_rfc3339, price::PriceFeed, vault::Vault, VERSION};
 use ssl_policy::{
     check_against_vault, check_payout, check_payout_terms, check_proposal, check_refund, deposit_status, DepositStatus, Limits, Proposal, RefundRejection,
@@ -345,25 +350,25 @@ impl Node {
         Ok((address, order.terms.zec_amount_zat))
     }
 
-    /// Round 1 of a treasury signing round. The operator checks the order with its own data
-    /// and the transaction against the order; only then does it commit nonces.
-    async fn round1(&self, req: Round1Request) -> Result<Round1Response, (StatusCode, String)> {
+    /// Every check this operator runs on a treasury spend before vouching for it: the order,
+    /// with its own data, and the transaction against the order. Returns the parsed request
+    /// and what it pays.
+    async fn check_spend(&self, kind: RoundKind, order_id: &str, pczt_b64: &str) -> Result<(ssl_sign::SigningRequest, u64), (StatusCode, String)> {
         let refuse = |m: String| (StatusCode::UNPROCESSABLE_ENTITY, m);
-        let share = self.frost.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "this operator has no FROST share configured".to_string()))?;
-        let what = req.kind.as_str();
-        let (to, amount) = match req.kind {
-            RoundKind::Refund => self.refund_terms(&req.order_id).await,
-            RoundKind::Payout => self.payout_terms(&req.order_id).await,
+        let what = kind.as_str();
+        let (to, amount) = match kind {
+            RoundKind::Refund => self.refund_terms(order_id).await,
+            RoundKind::Payout => self.payout_terms(order_id).await,
         }
         .map_err(|m| {
-            tracing::warn!(order = %req.order_id, kind = what, reason = %m, "refused to sign");
+            tracing::warn!(order = %order_id, kind = what, reason = %m, "refused treasury spend");
             refuse(m)
         })?;
 
-        let pczt = base64::engine::general_purpose::STANDARD.decode(&req.pczt).map_err(bad_request)?;
+        let pczt = base64::engine::general_purpose::STANDARD.decode(pczt_b64).map_err(bad_request)?;
         let request = ssl_sign::prepare(&pczt).map_err(bad_request)?;
         let txid = txid_from_sighash(&request.sighash).unwrap_or_default();
-        self.may_sign(req.kind, &req.order_id, &txid).await.map_err(refuse)?;
+        self.may_sign(kind, order_id, &txid).await.map_err(refuse)?;
         let checked: Result<u64, RefundRejection> = {
             let w = self.wallet.lock().await;
             let tip = w.heights().map_err(internal)?.0.unwrap_or(0);
@@ -373,15 +378,54 @@ impl Node {
             }
             let receiver = w.orchard_receiver(&to).map_err(|e| refuse(format!("{what} address: {e}")))?;
             let tx = refund_tx(&request.effects);
-            match req.kind {
+            match kind {
                 RoundKind::Refund => check_refund(&tx, &receiver, amount, self.max_refund_fee_zat, |a| w.is_treasury(a)),
                 RoundKind::Payout => check_payout(&tx, &receiver, amount, self.max_refund_fee_zat, |a| w.is_treasury(a)),
             }
         };
         let paid = checked.map_err(|r| {
-            tracing::warn!(order = %req.order_id, kind = what, rejection = %r, "refused to sign");
+            tracing::warn!(order = %order_id, kind = what, rejection = %r, "refused treasury spend");
             refuse(r.to_string())
         })?;
+        Ok((request, paid))
+    }
+
+    /// Records the spend this operator vouches for as the order's one refund or payout. The
+    /// settle loops then approve or claim it on the vault once the wallet sees it mined.
+    async fn record_spend(&self, kind: RoundKind, order_id: &str, txid: &str, expiry: u32) -> Result<(), (StatusCode, String)> {
+        let db = self.db.lock().await;
+        match kind {
+            RoundKind::Refund => db.execute("UPDATE orders SET refund_tx = ?1, refund_expiry = ?2 WHERE id = ?3", params![txid, expiry, order_id]),
+            RoundKind::Payout => db.execute(
+                "INSERT INTO payouts (order_id, txid, expiry, created_ns) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(order_id) DO UPDATE SET txid = excluded.txid, expiry = excluded.expiry",
+                params![order_id, txid, expiry, now_ns() as i64],
+            ),
+        }
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    /// An operator that was not among a round's signers still settles the spend: given the
+    /// unsigned transaction, it runs the same checks it would before signing and, if they
+    /// pass, records the txid. Its wallet then decides when the spend is mined, and it
+    /// approves the refund or claims the payout like a signer would.
+    async fn attest(&self, req: AttestRequest) -> Result<Value, (StatusCode, String)> {
+        let (request, paid) = self.check_spend(req.kind, &req.order_id, &req.pczt).await?;
+        let txid = txid_from_sighash(&request.sighash).unwrap_or_default();
+        let _signing = self.signing.lock().await;
+        self.may_sign(req.kind, &req.order_id, &txid).await.map_err(|m| (StatusCode::UNPROCESSABLE_ENTITY, m))?;
+        self.record_spend(req.kind, &req.order_id, &txid, request.effects.expiry_height).await?;
+        tracing::info!(order = %req.order_id, kind = req.kind.as_str(), tx = %txid, paid, "attested treasury spend");
+        Ok(json!({ "order": req.order_id, "txid": txid, "paid": paid }))
+    }
+
+    /// Round 1 of a treasury signing round. The operator checks the order with its own data
+    /// and the transaction against the order; only then does it commit nonces.
+    async fn round1(&self, req: Round1Request) -> Result<Round1Response, (StatusCode, String)> {
+        let share = self.frost.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "this operator has no FROST share configured".to_string()))?;
+        let what = req.kind.as_str();
+        let (request, paid) = self.check_spend(req.kind, &req.order_id, &req.pczt).await?;
 
         let sighash = hex::decode(&request.sighash).map_err(internal)?;
         let mut spends = vec![];
@@ -431,21 +475,7 @@ impl Node {
             let s = share.sign(&pkg.signing_package, nonces, &round.sighash, &alpha).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
             shares.push(SpendShare { pool, index, share: s });
         }
-        {
-            let db = self.db.lock().await;
-            match round.kind {
-                RoundKind::Refund => db.execute(
-                    "UPDATE orders SET refund_tx = ?1, refund_expiry = ?2 WHERE id = ?3",
-                    params![txid, round.expiry_height, round.order_id],
-                ),
-                RoundKind::Payout => db.execute(
-                    "INSERT INTO payouts (order_id, txid, expiry, created_ns) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(order_id) DO UPDATE SET txid = excluded.txid, expiry = excluded.expiry",
-                    params![round.order_id, txid, round.expiry_height, now_ns() as i64],
-                ),
-            }
-            .map_err(internal)?;
-        }
+        self.record_spend(round.kind, &round.order_id, &txid, round.expiry_height).await?;
         self.status.lock().await.last_signature_at = Some(now_ns());
         tracing::info!(order = %round.order_id, kind = round.kind.as_str(), tx = %txid, "signed treasury spend");
         Ok(Round2Response { identifier: share.identifier_hex(), shares })
@@ -646,6 +676,20 @@ async fn round1(State(n): State<App>, headers: HeaderMap, Json(r): Json<Round1Re
     }
 }
 
+async fn attest(State(n): State<App>, headers: HeaderMap, Json(r): Json<AttestRequest>) -> Response {
+    if !n.authorized(&headers) {
+        return err_json((StatusCode::UNAUTHORIZED, "missing or wrong bearer token".into()));
+    }
+    // Check against the freshest view of the treasury.
+    if let Err(e) = n.wallet.lock().await.sync().await {
+        tracing::warn!(error = %e, "sync before attesting");
+    }
+    match n.attest(r).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_json(e),
+    }
+}
+
 async fn round2(State(n): State<App>, headers: HeaderMap, Json(r): Json<Round2Request>) -> Response {
     if !n.authorized(&headers) {
         return err_json((StatusCode::UNAUTHORIZED, "missing or wrong bearer token".into()));
@@ -789,6 +833,7 @@ async fn main() -> Result<()> {
         .route("/v1/releases", post(releases))
         .route("/v1/signing/round1", post(round1))
         .route("/v1/signing/round2", post(round2))
+        .route("/v1/spends/attest", post(attest))
         .route("/v1/orders", get(orders))
         .with_state(node);
     let listener = tokio::net::TcpListener::bind(listen).await?;
