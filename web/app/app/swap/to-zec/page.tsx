@@ -20,7 +20,9 @@ function validZecAddress(a: string, testnet: boolean): boolean {
 function ToZecFlow() {
   const params = useSearchParams();
   const router = useRouter();
-  const { near } = useLive();
+  const { near, network } = useLive();
+  const availableZat = network?.treasury?.availableForPayoutsZat;
+  const availableZec = availableZat != null ? Number(availableZat) / 1e8 : null;
   const testnet = (near?.network ?? "testnet") !== "mainnet";
   const wallet = useNearWallet(testnet ? "testnet" : "mainnet");
   const [amount, setAmount] = useState("10");
@@ -142,7 +144,9 @@ function ToZecFlow() {
               <TokenBadge token={{ symbol: "ZEC", blockchain: "zec" }} size={32} />
               <div>
                 <div className="text-sm font-semibold">Shielded ZEC</div>
-                <div className="text-xs text-ink-3">paid to a unified address</div>
+                <div className="text-xs text-ink-3">
+                  {availableZec != null ? `Up to ${token(String(availableZec))} ZEC available` : "paid to a unified address"}
+                </div>
               </div>
             </div>
             <div className="mt-4 rounded-xl bg-sunken/70 px-3.5 py-3">
