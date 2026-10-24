@@ -10,7 +10,9 @@
 # its own host, run by a different party.
 
 x-protocol: &protocol
-  build: { context: ../protocol, dockerfile: Dockerfile }
+  # Dockerfile compiles on the server; Dockerfile.prebuilt uses binaries uploaded by
+  # push-binaries.sh, for servers with too little memory to compile (2 GB).
+  build: { context: ../protocol, dockerfile: "${PROTOCOL_DOCKERFILE:-Dockerfile}" }
   image: zec-ssl-protocol
   restart: unless-stopped
   environment: &protocol-env
