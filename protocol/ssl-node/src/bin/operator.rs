@@ -196,9 +196,15 @@ impl Node {
     }
 
     async fn record_signature(&self, order: &str, column: &str, tx: &str) {
+        // Fixed statements only: SQL text is never built from a parameter.
+        let sql = match column {
+            "approved_tx" => "UPDATE orders SET approved_tx = ?1 WHERE id = ?2",
+            "release_tx" => "UPDATE orders SET release_tx = ?1 WHERE id = ?2",
+            "refund_approval_tx" => "UPDATE orders SET refund_approval_tx = ?1 WHERE id = ?2",
+            other => return tracing::error!(column = other, "recording a signature: unknown column"),
+        };
         let db = self.db.lock().await;
-        let sql = format!("UPDATE orders SET {column} = ?1 WHERE id = ?2");
-        if let Err(e) = db.execute(&sql, params![tx, order]) {
+        if let Err(e) = db.execute(sql, params![tx, order]) {
             tracing::error!(error = %e, "recording a signature");
         }
         self.status.lock().await.last_signature_at = Some(now_ns());
