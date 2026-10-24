@@ -10,6 +10,18 @@ import type { ChartRange, FaucetInfo, NetworkSnapshot, Overview, QuoteRequest, S
 
 const ranges: ChartRange[] = ["1D", "7D", "30D", "1Y"];
 
+/** Order ids are what the coordinator issues: letters, digits, dash and underscore. */
+const ORDER_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Per-IP limits for routes that cost gas, reserve treasury funds or spend upstream quota. */
+const limit = (max: number, timeWindow: string) => ({ config: { rateLimit: { max, timeWindow } } });
+
+/** Live streams held open per client IP, and in total. */
+const STREAMS_PER_IP = 4;
+const STREAMS_TOTAL = 500;
+const openStreams = new Map<string, number>();
+let streamCount = 0;
+
 function emptyNetwork(): NetworkSnapshot {
   return {
     threshold: config.threshold,
@@ -51,7 +63,7 @@ export async function routes(app: FastifyInstance) {
 
   app.get("/v1/market", async () => store.state.market);
 
-  app.get<{ Params: { id: string }; Querystring: { range?: string } }>("/v1/market/:id/chart", async (req) => {
+  app.get<{ Params: { id: string }; Querystring: { range?: string } }>("/v1/market/:id/chart", limit(60, "1 minute"), async (req) => {
     const { id } = req.params;
     if (!(config.marketIds as readonly string[]).includes(id)) throw new HttpError(404, "unknown asset");
     const range = (req.query.range ?? "1D").toUpperCase() as ChartRange;
@@ -64,7 +76,7 @@ export async function routes(app: FastifyInstance) {
   app.get("/v1/intents/tokens", async () => store.state.intents);
   app.get("/v1/network", async () => snapshot("network"));
 
-  app.post<{ Body: QuoteRequest }>("/v1/quote", async (req) => {
+  app.post<{ Body: QuoteRequest }>("/v1/quote", limit(60, "1 minute"), async (req) => {
     const body = req.body ?? ({} as QuoteRequest);
     if (typeof body.amount !== "string" || typeof body.destinationAssetId !== "string") {
       throw new HttpError(400, "amount and destinationAssetId are required");
@@ -76,7 +88,7 @@ export async function routes(app: FastifyInstance) {
     return quote(body, store.state.intents);
   });
 
-  app.get<{ Params: { id: string } }>("/v1/accounts/:id", async (req) => accountStatus(req.params.id));
+  app.get<{ Params: { id: string } }>("/v1/accounts/:id", limit(60, "1 minute"), async (req) => accountStatus(req.params.id));
 
   app.get("/v1/faucet", async (): Promise<FaucetInfo> => {
     const token = store.state.network?.vaultToken;
@@ -89,35 +101,45 @@ export async function routes(app: FastifyInstance) {
     };
   });
 
-  app.post<{ Body: { accountId?: string } }>("/v1/faucet/register", async (req) => {
+  app.post<{ Body: { accountId?: string } }>("/v1/faucet/register", limit(10, "1 hour"), async (req) => {
     if (typeof req.body?.accountId !== "string") throw new HttpError(400, "accountId is required");
     return register(req.body.accountId.trim());
   });
 
-  app.post<{ Body: { accountId?: string } }>("/v1/faucet/usdc", async (req) => {
+  app.post<{ Body: { accountId?: string } }>("/v1/faucet/usdc", limit(10, "1 hour"), async (req) => {
     if (typeof req.body?.accountId !== "string") throw new HttpError(400, "accountId is required");
     return drip(req.body.accountId.trim(), req.ip);
   });
 
-  app.get<{ Params: { id: string } }>("/v1/orders/:id", async (req) => {
+  app.get<{ Params: { id: string } }>("/v1/orders/:id", limit(120, "1 minute"), async (req) => {
     if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected.");
+    if (!ORDER_ID.test(req.params.id)) throw new HttpError(400, "not a valid order id");
     return orderDetail(req.params.id);
   });
 
-  app.post("/v1/orders", async (req) => {
+  // Opening an order makes every operator send a NEAR transaction (gas), so it is limited
+  // hard per client; the coordinator also caps unfunded orders in total.
+  app.post("/v1/orders", limit(5, "10 minutes"), async (req) => {
     if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected, so orders cannot be opened yet.");
     return createOrder(req.body);
   });
 
   // Direction 2: quote vault tokens → shielded ZEC. The user then locks the tokens with the
   // returned ft_transfer_call from their own NEAR wallet.
-  app.post("/v1/payouts", async (req) => {
+  app.post("/v1/payouts", limit(5, "10 minutes"), async (req) => {
     if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected, so payouts cannot be quoted yet.");
     return createPayout(req.body);
   });
 
   // Server-Sent Events: a snapshot of every topic on connect, then each update as it lands.
   app.get("/v1/stream", (req, reply) => {
+    const held = openStreams.get(req.ip) ?? 0;
+    if (held >= STREAMS_PER_IP || streamCount >= STREAMS_TOTAL) {
+      reply.status(429).send({ error: "too many open live streams" });
+      return;
+    }
+    openStreams.set(req.ip, held + 1);
+    streamCount += 1;
     const origin = req.headers.origin;
     reply.raw.writeHead(200, {
       "content-type": "text/event-stream",
@@ -139,6 +161,10 @@ export async function routes(app: FastifyInstance) {
     req.raw.on("close", () => {
       clearInterval(heartbeat);
       store.off("update", onUpdate);
+      streamCount -= 1;
+      const left = (openStreams.get(req.ip) ?? 1) - 1;
+      if (left > 0) openStreams.set(req.ip, left);
+      else openStreams.delete(req.ip);
     });
   });
 }
