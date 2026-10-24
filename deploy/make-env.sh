@@ -36,6 +36,8 @@ umask 077
     echo "OP${i}_NEAR_KEY=$(key "$PREFIX-op$i.testnet")"
     echo "OP${i}_FROST_KEY_PACKAGE=$(frost "op$i" key_package)"
   done
+  # Set PREBUILT=1 for servers that run binaries uploaded by push-binaries.sh.
+  [ -n "${PREBUILT:-}" ] && echo "PROTOCOL_DOCKERFILE=Dockerfile.prebuilt"
   echo "API_DOMAIN=$API_DOMAIN"
   echo "CORS_ORIGINS=$WEB_ORIGIN"
   if [ -f "$CREDS/$PREFIX-usdc.testnet.json" ]; then
