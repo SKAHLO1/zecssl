@@ -36,6 +36,8 @@
 //!   FROST_CONFIG + FROST_GROUP_KEY   any participant's frost-client config and the group
 //!                            (optional: without it the coordinator cannot run refunds)
 //!   REFUND_FEE_ZAT           10000, kept back from each refund for the network fee
+//!   MAX_OPEN_ORDERS          30, unfunded orders / unlocked quotes open at once, per direction
+//!   MAX_OPEN_ORDERS_PER_ACCOUNT  3, the same per NEAR account
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -97,6 +99,11 @@ struct Coordinator {
     last_sync: Mutex<(Option<u64>, Option<String>)>,
     frost: Option<ssl_frost::Coordinator>,
     refund_fee_zat: u64,
+    /// Most unfunded orders (direction 1) or unlocked quotes (direction 2) open at once, in
+    /// total and per NEAR account. Each direction-1 order costs operators gas to open, and
+    /// each quote reserves treasury ZEC, so spam must not be able to open them without end.
+    max_open: i64,
+    max_open_per_account: i64,
     /// When each order's spend was last sent to the operators to attest.
     attested: Mutex<HashMap<String, std::time::Instant>>,
 }
@@ -307,6 +314,7 @@ impl Coordinator {
         if !valid_refund_address(is_test, &req.refund_address) {
             return Err(bad("refund address must be a shielded unified address"));
         }
+        self.check_open_limit("zec_to_near", &req.recipient).await?;
         let zec_usd = self.prices.zec_usd().await.ok_or((StatusCode::SERVICE_UNAVAILABLE, "no ZEC price available".into()))?;
         let amount_out = self.quote(zec_zat, zec_usd);
         if amount_out > self.max_amount_out {
@@ -706,6 +714,7 @@ impl Coordinator {
             return Err(bad("payout address must be a shielded unified address"));
         }
         self.wallet.lock().await.orchard_receiver(&req.zec_address).map_err(|e| bad(&format!("payout address: {e}")))?;
+        self.check_open_limit("near_to_zec", &req.account).await?;
         let zec_usd = self.prices.zec_usd().await.ok_or((StatusCode::SERVICE_UNAVAILABLE, "no ZEC price available".into()))?;
         let usd = amount_in as f64 / 10f64.powi(decimals as i32);
         let zec_zat = (usd / (zec_usd / (1.0 - self.spread_bps as f64 / 10_000.0)) * 1e8).floor() as u64;
@@ -799,6 +808,27 @@ impl Coordinator {
                 tracing::debug!(order = id, operator = %op.name, error = %e, "attest");
             }
         }
+    }
+
+    /// Refuses a new order when too many are already waiting to be funded (direction 1) or
+    /// locked (direction 2), in total or for this NEAR account.
+    async fn check_open_limit(&self, direction: &str, account: &str) -> Result<(), (StatusCode, String)> {
+        let sql = if direction == "near_to_zec" {
+            "SELECT COUNT(*), COALESCE(SUM(recipient = ?2), 0) FROM orders WHERE direction = ?1 AND state = 'awaiting_lock'"
+        } else {
+            "SELECT COUNT(*), COALESCE(SUM(recipient = ?2), 0) FROM orders WHERE direction = ?1 AND state IN ('proposing', 'awaiting_deposit')"
+        };
+        let (total, mine): (i64, i64) = {
+            let db = self.db.lock().await;
+            db.query_row(sql, params![direction, account], |r| Ok((r.get(0)?, r.get(1)?))).map_err(internal)?
+        };
+        if mine >= self.max_open_per_account {
+            return Err((StatusCode::TOO_MANY_REQUESTS, format!("this account already has {mine} open orders; fund or let them expire first")));
+        }
+        if total >= self.max_open {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "too many orders are waiting right now; try again in a few minutes".into()));
+        }
+        Ok(())
     }
 
     /// ZEC promised to direction-2 orders that are quoted or locked but not yet paid, plus
@@ -1252,6 +1282,8 @@ async fn main() -> Result<()> {
         frost,
         refund_fee_zat,
         attested: Mutex::new(HashMap::new()),
+        max_open: config::num("MAX_OPEN_ORDERS", 30)?,
+        max_open_per_account: config::num("MAX_OPEN_ORDERS_PER_ACCOUNT", 3)?,
     });
     tracing::info!(vault = %coordinator.vault.contract, operators = coordinator.operators.len(), %listen, "coordinator starting");
 
