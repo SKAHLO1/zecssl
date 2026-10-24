@@ -226,6 +226,8 @@ export interface NetworkEvent {
 
 export interface TreasuryState {
   shieldedBalanceZat: string | null;
+  /** What a new USDC → ZEC order can still be paid from, after open orders and fees. */
+  availableForPayoutsZat: string | null;
   addressesIssued: number | null;
   lastScanHeight: number | null;
   vaultLiquidity: { symbol: string; amount: string }[];
