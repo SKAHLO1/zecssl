@@ -10,6 +10,7 @@ import { OrderBadge } from "@/components/network";
 import { TokenBadge, TokenSelect } from "@/components/token-select";
 import { buttonClass, Card, cx, Mono, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
+import { rememberOrder } from "@/lib/my-orders";
 import { chainName, duration, token, usd } from "@/lib/format";
 import { useLive } from "@/lib/live";
 import type { AccountStatus, IntentsToken, OrderDetail, Quote } from "@/lib/types";
@@ -213,6 +214,7 @@ function SwapFlow() {
         quotedAmountOut: quote.amountOut,
       })) as OpenedOrder;
       setOrder(res);
+      rememberOrder(res.id);
       setStep(2);
     } catch (e) {
       setSubmitError((e as Error).message);
