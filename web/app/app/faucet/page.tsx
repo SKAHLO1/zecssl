@@ -13,9 +13,13 @@ const ZEC_FAUCETS = [
   { name: "Jino Labs", url: "https://zcashfaucet.jinolabs.xyz/", note: "0.1 TAZ, sent shielded; a short in-browser puzzle instead of a captcha" },
 ];
 
+// The same wallets the site's NEAR wallet picker offers. MyNearWallet is being sunset.
 const NEAR_WALLETS = [
-  { name: "MyNearWallet (testnet)", url: "https://testnet.mynearwallet.com/" },
-  { name: "Meteor Wallet", url: "https://wallet.meteorwallet.app/" },
+  { name: "Meteor Wallet", url: "https://wallet.meteorwallet.app/", note: "web, extension and mobile; switch the network to testnet" },
+  { name: "HERE Wallet", url: "https://www.herewallet.app/", note: "mobile" },
+  { name: "Intear Wallet", url: "https://wallet.intear.tech/", note: "web" },
+  { name: "Sender", url: "https://sender.org/", note: "browser extension" },
+  { name: "MyNearWallet (testnet)", url: "https://testnet.mynearwallet.com/", note: "being sunset; deprecated 31 October 2026" },
 ];
 
 function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
@@ -94,6 +98,7 @@ export default function FaucetPage() {
               <a href={w.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 font-medium text-forest hover:underline">
                 {w.name} <ExternalLink className="size-3.5" />
               </a>
+              <span className="block text-xs text-ink-3">{w.note}</span>
             </li>
           ))}
         </ul>
