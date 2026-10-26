@@ -107,6 +107,8 @@ interface ContractConfig {
   token_symbol: string;
   token_decimals: number;
   threshold: number;
+  challenge_window_ns: string;
+  challenge_bond: string;
 }
 
 interface ContractOperator {
@@ -131,6 +133,7 @@ interface ContractOrder {
   closed_at: string;
   claimed_at: string;
   zcash_txid?: string | null;
+  user?: string | null;
 }
 
 const orderStates: Record<string, OrderState> = {
@@ -151,6 +154,21 @@ const orderStates: Record<string, OrderState> = {
 const nsToIso = (ns: string) => new Date(Number(BigInt(ns) / 1_000_000n)).toISOString();
 const units = (raw: string, decimals: number) => Number(raw) / 10 ** decimals;
 
+/*
+ * Public feeds (the network snapshot every visitor receives) show that swaps happen, not
+ * whose. An order id is what opens an order's page, which shows its recipient and addresses,
+ * so ids are masked; NEAR account names are removed from event text. The full details stay
+ * available by order id (the link a user keeps or shares) and per account.
+ */
+const ORDER_ID = /\b(z[sp])-\d+-([0-9a-f]{6})\b/g;
+const NEAR_NAME = /\b[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.(?:testnet|near)\b/g;
+const maskId = (s: string) => s.replace(ORDER_ID, (_m, prefix: string, hex: string) => `${prefix}-…${hex.slice(-2)}`);
+const publicText = (s: string) => maskId(s).replace(NEAR_NAME, "a NEAR account");
+const publicOrders = (orders: Order[]): Order[] => orders.map(({ recipient: _recipient, ...o }) => ({ ...o, id: maskId(o.id) }));
+const publicRounds = (rounds: SigningRound[]): SigningRound[] => rounds.map((r) => ({ ...r, id: maskId(r.id), orderId: maskId(r.orderId) }));
+const publicEvents = (events: NetworkEvent[]): NetworkEvent[] =>
+  events.map((e) => ({ ...e, title: publicText(e.title), detail: publicText(e.detail), orderId: e.orderId ? maskId(e.orderId) : e.orderId }));
+
 function mapOrder(o: ContractOrder, cfg: ContractConfig): Order {
   // Show progress toward whichever threshold the order is waiting on.
   const signatures = o.state === "open" ? o.release_approvals.length : o.approvers.length;
@@ -167,6 +185,7 @@ function mapOrder(o: ContractOrder, cfg: ContractConfig): Order {
     createdAt: nsToIso(o.created_at),
     updatedAt: nsToIso(last),
     nearTxHash: null,
+    recipient: o.user ?? o.terms.recipient,
   };
 }
 
@@ -312,9 +331,9 @@ export async function pollNetwork(): Promise<NetworkSnapshot> {
           reserves: contracts?.reserves ?? null,
         }
       : (prev?.treasury ?? null),
-    orders,
-    rounds: coordinatorData?.rounds ?? prev?.rounds ?? [],
-    events: coordinatorData?.events ?? prev?.events ?? [],
+    orders: publicOrders(orders),
+    rounds: publicRounds(coordinatorData?.rounds ?? prev?.rounds ?? []),
+    events: publicEvents(coordinatorData?.events ?? prev?.events ?? []),
     vaultToken: contracts?.cfg
       ? {
           assetId: `vault:${contracts.cfg.token}`,
@@ -387,9 +406,24 @@ export async function orderDetail(id: string): Promise<OrderDetail> {
           releaseDeadline: onChain.release_deadline !== "0" ? nsToIso(onChain.release_deadline) : null,
           claimedTxid: onChain.zcash_txid ?? null,
           claimedAt: onChain.claimed_at && onChain.claimed_at !== "0" ? nsToIso(onChain.claimed_at) : null,
+          // What the user needs to challenge a claim: when the window closes, the bond, and
+          // the token the bond is paid in.
+          challengeEndsAt:
+            onChain.claimed_at && onChain.claimed_at !== "0" && slow?.cfg
+              ? nsToIso((BigInt(onChain.claimed_at) + BigInt(slow.cfg.challenge_window_ns)).toString())
+              : null,
+          challengeBond: slow?.cfg ? String(units(slow.cfg.challenge_bond, slow.cfg.token_decimals)) : null,
+          challengeBondRaw: slow?.cfg?.challenge_bond ?? null,
+          token: slow?.cfg?.token ?? null,
         }
       : null,
   };
+}
+
+/** The orders paid to (direction 1) or locked by (direction 2) one NEAR account. */
+export async function accountOrders(accountId: string): Promise<Order[]> {
+  const { data } = await fetchJson<Order[]>(`${config.coordinatorUrl}/v1/orders?limit=200`, { timeoutMs: 10_000 });
+  return data.filter((o) => o.recipient === accountId);
 }
 
 /** Asks the coordinator for a direction-2 quote and the transfer that locks the tokens. */
