@@ -1,4 +1,4 @@
-import type { AccountStatus, ChartRange, FaucetInfo, OrderDetail, Overview, PayoutQuote, PriceChart, Quote, QuoteRequest } from "./types";
+import type { AccountStatus, ChartRange, FaucetInfo, Order, OrderDetail, Overview, PayoutQuote, PriceChart, Quote, QuoteRequest } from "./types";
 
 /** Base URL the browser uses. */
 export const publicApiUrl = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(/\/$/, "");
@@ -30,6 +30,7 @@ export const api = {
     call<Quote>("/v1/quote", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(req) }),
   order: (id: string) => call<OrderDetail>(`/v1/orders/${encodeURIComponent(id)}`),
   account: (id: string) => call<AccountStatus>(`/v1/accounts/${encodeURIComponent(id)}`),
+  accountOrders: (id: string) => call<Order[]>(`/v1/accounts/${encodeURIComponent(id)}/orders`),
   faucet: () => call<FaucetInfo>("/v1/faucet"),
   faucetRegister: (accountId: string) =>
     call<{ txHash: string | null; status: AccountStatus }>("/v1/faucet/register", {
