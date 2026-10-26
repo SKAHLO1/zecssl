@@ -1,12 +1,13 @@
 "use client";
 
-import { Activity, ArrowRight, ChartCandlestick, Droplets, Gauge, LayoutDashboard, Menu, Network, Repeat, Vault, X } from "lucide-react";
+import { Activity, ArrowRight, ChartCandlestick, Droplets, Gauge, LayoutDashboard, LogOut, Menu, Network, Repeat, Vault, Wallet, X } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { num } from "@/lib/format";
 import { useLive } from "@/lib/live";
+import { useNearWallet } from "@/lib/near-wallet";
 import { buttonClass, cx, Logo, StatusDot } from "./ui";
 
 const nav = [
@@ -59,6 +60,36 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
+/** The connected NEAR wallet, on every app page: connect, see which account, disconnect. */
+function WalletButton() {
+  const { near } = useLive();
+  const wallet = useNearWallet(near?.network === "mainnet" ? "mainnet" : "testnet");
+  if (!wallet.accountId) {
+    return (
+      <button className={cx(buttonClass.secondary, "px-3 py-2 sm:px-4")} onClick={() => void wallet.connect()} disabled={!wallet.ready} aria-label="Connect NEAR wallet">
+        <Wallet className="size-4" />
+        <span className="hidden sm:inline">Connect wallet</span>
+      </button>
+    );
+  }
+  return (
+    <div className="flex items-center gap-1 rounded-full border border-line bg-surface py-1 pr-1 pl-3 text-xs">
+      <StatusDot state="ok" />
+      <span className="max-w-[8rem] truncate font-medium sm:max-w-[12rem]" title={wallet.accountId}>
+        {wallet.accountId}
+      </span>
+      <button
+        className="inline-flex items-center gap-1 rounded-full px-2 py-1.5 text-ink-2 hover:bg-sunken hover:text-ink"
+        onClick={() => void wallet.disconnect()}
+        aria-label="Disconnect wallet"
+      >
+        <LogOut className="size-3.5" />
+        <span className="hidden sm:inline">Disconnect</span>
+      </button>
+    </div>
+  );
+}
+
 function TopBar({ title, onMenu }: { title: string; onMenu: () => void }) {
   const { near, zcash, connection } = useLive();
   return (
@@ -77,6 +108,7 @@ function TopBar({ title, onMenu }: { title: string; onMenu: () => void }) {
             <span className="text-line-strong">|</span>
             NEAR {near?.network} <span className="tnum font-semibold text-ink">{num(near?.height)}</span>
           </span>
+          <WalletButton />
           <Link href="/app/swap" className={cx(buttonClass.primary, "px-4 py-2")}>
             Swap <ArrowRight className="size-4" />
           </Link>
