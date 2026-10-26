@@ -1,8 +1,6 @@
 node_modules
 .next
 dist
-.env
-.env.local
 *.tsbuildinfo
 next-env.d.ts
 protocol/target
@@ -10,3 +8,4 @@ protocol/bin
 contracts/res
 contracts/target
 deploy/.env
+config.bat

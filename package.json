@@ -7,9 +7,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev:server": "pnpm --filter @zec-ssl/server dev",
-    "dev:web": "pnpm --filter @zec-ssl/web dev",
-    "build": "pnpm --filter @zec-ssl/server build && pnpm --filter @zec-ssl/web build",
+    "dev:server": "node init && pnpm --filter @zec-ssl/server dev",
+    "dev:web": "node init && pnpm --filter @zec-ssl/web dev",
+    "build": "node init && pnpm --filter @zec-ssl/server build && pnpm --filter @zec-ssl/web build",
     "typecheck": "pnpm -r typecheck"
   }
 }
