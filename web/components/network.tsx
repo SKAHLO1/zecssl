@@ -84,7 +84,11 @@ export function CoordinatorEmpty({ what }: { what: string }) {
   return null;
 }
 
-export function OrdersTable({ orders, limit }: { orders: Order[]; limit?: number }) {
+/**
+ * `linkable` is for a user's own orders. Public lists get masked ids from the API (an id is
+ * what opens an order's page), so their rows are not links.
+ */
+export function OrdersTable({ orders, limit, linkable = false }: { orders: Order[]; limit?: number; linkable?: boolean }) {
   const now = useNow();
   const { network } = useLive();
   const rows = limit ? orders.slice(0, limit) : orders;
@@ -111,12 +115,16 @@ export function OrdersTable({ orders, limit }: { orders: Order[]; limit?: number
           </tr>
         </thead>
         <tbody>
-          {rows.map((o) => (
-            <tr key={o.id} className="border-b border-line last:border-0">
+          {rows.map((o, i) => (
+            <tr key={`${o.id}-${i}`} className="border-b border-line last:border-0">
               <td className="py-3 pr-4">
-                <Link href={`/app/orders/${encodeURIComponent(o.id)}`} className="text-forest hover:underline">
-                  <Mono>{shortHash(o.id, 8, 4)}</Mono>
-                </Link>
+                {linkable ? (
+                  <Link href={`/app/orders/${encodeURIComponent(o.id)}`} className="text-forest hover:underline">
+                    <Mono>{shortHash(o.id, 8, 4)}</Mono>
+                  </Link>
+                ) : (
+                  <Mono className="text-ink-3">{o.id}</Mono>
+                )}
               </td>
               <td className="py-3 pr-4">{o.direction === "zec_to_near" ? `ZEC → ${o.destinationSymbol}` : `${o.destinationSymbol} → ZEC`}</td>
               <td className="tnum py-3 pr-4 text-right">
