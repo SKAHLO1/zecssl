@@ -1,16 +1,17 @@
 "use client";
 
-import { ArrowLeft, Check, Copy, ExternalLink, LoaderCircle, TriangleAlert } from "lucide-react";
+import { ArrowLeft, Check, Copy, ExternalLink, Gavel, LoaderCircle, TriangleAlert, Wallet } from "lucide-react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { DepositQr } from "@/components/deposit-qr";
 import { OrderBadge } from "@/components/network";
-import { Card, cx, EmptyState, Mono } from "@/components/ui";
+import { buttonClass, Card, cx, EmptyState, Mono } from "@/components/ui";
 import { api } from "@/lib/api";
 import { explorer, netOf } from "@/lib/explorers";
 import { token } from "@/lib/format";
 import { useLive, useNow } from "@/lib/live";
+import { useNearWallet } from "@/lib/near-wallet";
 import type { NetworkEvent, OrderDetail } from "@/lib/types";
 
 const FINAL = ["released", "refunded", "expired", "compensated", "settled", "reimbursed"];
@@ -90,6 +91,65 @@ function Timeline({ events, state, zecOut }: { events: NetworkEvent[]; state: st
         </li>
       )}
     </ol>
+  );
+}
+
+/**
+ * Direction 2: while operators' settlement claim can still be challenged, the account that
+ * locked the tokens can dispute it by posting the challenge bond. Arbiters then decide from
+ * the payment evidence; a false claim is paid from the operators' bonds.
+ */
+function ChallengeCard({ order, now, net }: { order: OrderDetail; now: number; net: "testnet" | "mainnet" }) {
+  const wallet = useNearWallet(net);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const v = order.vault;
+  if (!v || v.state !== "claimed" || !v.challengeEndsAt || !v.challengeBondRaw || !v.token) return null;
+  const endsAt = new Date(v.challengeEndsAt).getTime();
+  const left = now ? Math.max(0, Math.floor((endsAt - now) / 1000)) : null;
+  if (left === 0) return null;
+  const isOwner = wallet.accountId === order.recipient;
+
+  async function challenge() {
+    if (!v?.token || !v.challengeBondRaw) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await wallet.challenge(v.token, v.contract, order.id, v.challengeBondRaw);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card title="Didn't receive your ZEC?">
+      <p className="text-sm text-ink-2">
+        The operators have claimed this payout on the vault. If the ZEC never reached <Mono className="break-all">{order.payoutAddress ?? "your address"}</Mono>, you can challenge the
+        claim{left != null ? ` for another ${Math.floor(left / 3600)}h ${Math.floor((left % 3600) / 60)}m` : ""}. It costs a {v.challengeBond} {order.destinationSymbol} bond: if
+        the claim was false, arbiters pay you from the operators&apos; bonds and return it; if the ZEC did arrive, the bond is lost.
+      </p>
+      {error && <p className="mt-3 text-sm text-down">{error}</p>}
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        {!wallet.accountId ? (
+          <button className={buttonClass.secondary} onClick={() => void wallet.connect()} disabled={!wallet.ready}>
+            <Wallet className="size-4" /> Connect {order.recipient ?? "your NEAR wallet"}
+          </button>
+        ) : isOwner ? (
+          <button className={buttonClass.primary} onClick={() => void challenge()} disabled={busy}>
+            {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Gavel className="size-4" />} Challenge this claim ({v.challengeBond} {order.destinationSymbol} bond)
+          </button>
+        ) : (
+          <p className="text-sm text-ink-3">
+            Connected as <Mono>{wallet.accountId}</Mono>. Only <Mono>{order.recipient}</Mono>, the account that locked the tokens, can challenge.{" "}
+            <button className="text-forest hover:underline" onClick={() => void wallet.disconnect()}>
+              Switch account
+            </button>
+          </p>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -223,6 +283,7 @@ export default function OrderPage() {
               )}
             </Card>
           )}
+          {zecOut && <ChallengeCard order={order} now={now} net={net} />}
           {!zecOut && (
           <Card title="Deposit">
             {awaiting && order.depositAddress && uri ? (
