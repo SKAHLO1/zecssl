@@ -86,20 +86,30 @@ export function useNearWallet(network: "testnet" | "mainnet" = "testnet") {
     if (selector.isSignedIn()) await (await selector.wallet()).signOut();
   }, [network]);
 
-  /** Sends the quote's ft_transfer_call from the connected account. Browser wallets
-   * navigate away and come back; injected ones resolve with the outcome. */
-  const lock = useCallback(
-    async (quote: PayoutQuote) => {
+  /** Sends vault tokens to the vault with an ft_transfer_call from the connected account.
+   * Browser wallets navigate away and come back; injected ones resolve with the outcome. */
+  const transferCall = useCallback(
+    async (token: string, args: { receiver_id: string; amount: string; msg: string }) => {
       const { selector } = await load(network);
       const { actionCreators } = await import("@near-wallet-selector/core");
       const wallet = await selector.wallet();
       return wallet.signAndSendTransaction({
-        receiverId: quote.token,
-        actions: [actionCreators.functionCall("ft_transfer_call", quote.transfer, TRANSFER_GAS, BigInt(1))],
+        receiverId: token,
+        actions: [actionCreators.functionCall("ft_transfer_call", args, TRANSFER_GAS, BigInt(1))],
       });
     },
     [network],
   );
 
-  return { accountId, ready, connect, disconnect, lock };
+  /** Locks tokens for a quoted ZEC payout. */
+  const lock = useCallback((quote: PayoutQuote) => transferCall(quote.token, quote.transfer), [transferCall]);
+
+  /** Challenges a direction-2 settlement claim, posting the challenge bond. */
+  const challenge = useCallback(
+    (token: string, vault: string, orderId: string, bondRaw: string) =>
+      transferCall(token, { receiver_id: vault, amount: bondRaw, msg: JSON.stringify({ action: "challenge", order_id: orderId }) }),
+    [transferCall],
+  );
+
+  return { accountId, ready, connect, disconnect, lock, challenge };
 }
