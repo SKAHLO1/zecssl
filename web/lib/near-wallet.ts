@@ -13,13 +13,41 @@ let loading: Promise<Loaded> | null = null;
 
 function load(network: "testnet" | "mainnet"): Promise<Loaded> {
   loading ??= (async () => {
-    const [{ setupWalletSelector }, { setupModal }, { setupMyNearWallet }, { setupMeteorWallet }] = await Promise.all([
+    const [
+      { setupWalletSelector },
+      { setupModal },
+      { setupMeteorWallet },
+      { setupHereWallet },
+      { setupIntearWallet },
+      { setupSender },
+      { setupNightly },
+      { setupLedger },
+      { setupMyNearWallet },
+    ] = await Promise.all([
       import("@near-wallet-selector/core"),
       import("@near-wallet-selector/modal-ui"),
-      import("@near-wallet-selector/my-near-wallet"),
       import("@near-wallet-selector/meteor-wallet"),
+      import("@near-wallet-selector/here-wallet"),
+      import("@near-wallet-selector/intear-wallet"),
+      import("@near-wallet-selector/sender"),
+      import("@near-wallet-selector/nightly"),
+      import("@near-wallet-selector/ledger"),
+      import("@near-wallet-selector/my-near-wallet"),
     ]);
-    const selector = await setupWalletSelector({ network, modules: [setupMyNearWallet(), setupMeteorWallet()] });
+    // Browser, mobile, extension and hardware wallets, all working on testnet. MyNearWallet is
+    // being sunset (deprecated 31 October 2026), so it is marked deprecated and listed last.
+    const selector = await setupWalletSelector({
+      network,
+      modules: [
+        setupMeteorWallet(),
+        setupHereWallet(),
+        setupIntearWallet(),
+        setupSender(),
+        setupNightly(),
+        setupLedger(),
+        setupMyNearWallet({ deprecated: true }),
+      ],
+    });
     const modal = setupModal(selector, { description: "Connect the NEAR account that holds the tokens you want to swap for shielded ZEC." });
     return { selector, modal };
   })();
