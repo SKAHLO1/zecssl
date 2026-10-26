@@ -16,6 +16,8 @@ const csp = [
   "img-src 'self' data: blob: https:",
   "font-src 'self' data: https://fonts.gstatic.com",
   `connect-src 'self' https: wss:${dev ? " http://localhost:* ws://localhost:*" : ""}`,
+  // Some NEAR wallets (HERE, Intear) show their connect screen in an embedded frame.
+  "frame-src 'self' https:",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
