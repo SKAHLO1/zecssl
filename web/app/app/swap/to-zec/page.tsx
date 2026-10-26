@@ -7,6 +7,7 @@ import { Suspense, useEffect, useState } from "react";
 import { TokenBadge } from "@/components/token-select";
 import { buttonClass, Card, cx, Mono } from "@/components/ui";
 import { api } from "@/lib/api";
+import { rememberOrder } from "@/lib/my-orders";
 import { token } from "@/lib/format";
 import { useLive } from "@/lib/live";
 import { useNearWallet } from "@/lib/near-wallet";
@@ -46,7 +47,9 @@ function ToZecFlow() {
     setBusy("quote");
     setError(null);
     try {
-      setQuote(await api.createPayout({ amountIn: amount, account: wallet.accountId, zecAddress: zecAddress.trim() }));
+      const q = await api.createPayout({ amountIn: amount, account: wallet.accountId, zecAddress: zecAddress.trim() });
+      rememberOrder(q.id);
+      setQuote(q);
     } catch (e) {
       setError((e as Error).message);
     } finally {
