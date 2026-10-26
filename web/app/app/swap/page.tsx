@@ -479,6 +479,20 @@ function SwapFlow() {
                   {live.amountOut} {live.destinationSymbol} was paid to <Mono>{live.recipient}</Mono> after {live.threshold} operators each confirmed your deposit on
                   Zcash.
                 </p>
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <Link href={`/app/orders/${order.id}`} className={buttonClass.primary}>
+                    View order details <ArrowRight className="size-4" />
+                  </Link>
+                  <button
+                    className={buttonClass.secondary}
+                    onClick={() => {
+                      setOrder(null);
+                      setStep(0);
+                    }}
+                  >
+                    New swap
+                  </button>
+                </div>
               </div>
             )}
           </div>
