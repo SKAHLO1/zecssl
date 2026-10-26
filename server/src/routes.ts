@@ -4,11 +4,14 @@ import { errorMessage, HttpError } from "./http.js";
 import { fetchChart } from "./sources/coingecko.js";
 import { quote } from "./sources/intents.js";
 import { accountStatus, drip, faucetEnabled, register } from "./sources/faucet.js";
-import { coordinatorQuote, createOrder, createPayout, orderDetail } from "./sources/network.js";
+import { accountOrders, coordinatorQuote, createOrder, createPayout, orderDetail } from "./sources/network.js";
 import { store } from "./store.js";
 import type { ChartRange, FaucetInfo, NetworkSnapshot, Overview, QuoteRequest, StreamTopic } from "./types.js";
 
 const ranges: ChartRange[] = ["1D", "7D", "30D", "1Y"];
+
+/** NEAR account ids: named (alice.testnet) or implicit (64 hex characters). */
+const NEAR_ACCOUNT_ID = /^(?:[a-z0-9_-]+\.)*[a-z0-9_-]+$|^[0-9a-f]{64}$/;
 
 /** Order ids are what the coordinator issues: letters, digits, dash and underscore. */
 const ORDER_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -89,6 +92,13 @@ export async function routes(app: FastifyInstance) {
   });
 
   app.get<{ Params: { id: string } }>("/v1/accounts/:id", limit(60, "1 minute"), async (req) => accountStatus(req.params.id));
+
+  // One account's orders, for "Your orders". The public snapshot masks order ids.
+  app.get<{ Params: { id: string } }>("/v1/accounts/:id/orders", limit(30, "1 minute"), async (req) => {
+    if (!config.coordinatorUrl) throw new HttpError(503, "The ZEC SSL coordinator is not connected.");
+    if (!NEAR_ACCOUNT_ID.test(req.params.id)) throw new HttpError(400, "not a valid NEAR account id");
+    return accountOrders(req.params.id);
+  });
 
   app.get("/v1/faucet", async (): Promise<FaucetInfo> => {
     const token = store.state.network?.vaultToken;
