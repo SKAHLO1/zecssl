@@ -202,6 +202,8 @@ export interface Order {
   createdAt: string;
   updatedAt: string;
   nearTxHash: string | null;
+  /** Direction 1: the NEAR account paid. Direction 2: the NEAR account that locked tokens. */
+  recipient?: string;
 }
 
 export interface SigningRound {
@@ -222,6 +224,8 @@ export interface NetworkEvent {
   title: string;
   detail: string;
   at: string;
+  /** The order the event belongs to, when it belongs to one. */
+  orderId?: string | null;
 }
 
 export interface TreasuryState {
@@ -290,6 +294,12 @@ export interface OrderDetail extends Order {
     /** Direction 2: the Zcash txid operators claimed, and when the claim reached threshold. */
     claimedTxid?: string | null;
     claimedAt?: string | null;
+    /** Direction 2: when a claim stops being challengeable, and the bond to challenge it. */
+    challengeEndsAt?: string | null;
+    challengeBond?: string | null;
+    challengeBondRaw?: string | null;
+    /** The vault token contract (bonds and challenges are paid in it). */
+    token?: string | null;
   } | null;
   events: NetworkEvent[];
 }
