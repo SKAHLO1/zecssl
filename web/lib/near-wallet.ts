@@ -62,7 +62,9 @@ export function useNearWallet(network: "testnet" | "mainnet" = "testnet") {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
+    // Keep the subscription object itself: its unsubscribe method needs it as `this`, and
+    // calling a detached copy throws during cleanup, which crashed page navigation.
+    let subscription: { unsubscribe: () => void } | undefined;
     let cancelled = false;
     load(network)
       .then(({ selector }) => {
@@ -70,12 +72,12 @@ export function useNearWallet(network: "testnet" | "mainnet" = "testnet") {
         const pick = () => selector.store.getState().accounts.find((a) => a.active)?.accountId ?? null;
         setAccountId(pick());
         setReady(true);
-        unsubscribe = selector.store.observable.subscribe(() => setAccountId(pick())).unsubscribe;
+        subscription = selector.store.observable.subscribe(() => setAccountId(pick()));
       })
       .catch(() => setReady(true));
     return () => {
       cancelled = true;
-      unsubscribe?.();
+      subscription?.unsubscribe();
     };
   }, [network]);
 
